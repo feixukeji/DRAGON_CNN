@@ -1,0 +1,322 @@
+# -*- coding: utf-8 -*-
+import click
+import logging
+import os
+
+import torch
+import torch.nn as nn
+
+from tqdm import tqdm
+
+from data_preprocessing import FITSDataset, get_data_loader
+from pytorch_grad_cam import GradCAM, EigenGradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
+import kornia.augmentation as K
+
+from cnn import model_factory
+from utils import (
+    discover_devices,
+    enable_dropout,
+    specify_dropout_rate,
+)
+
+import cv2
+
+
+def heatmap(
+        model_path,
+        output_path,
+        dataset,
+        cutout_size,
+        channels,
+        parallel=False,
+        batch_size=256,
+        n_workers=1,
+        num_classes=6,
+        model_type="dragon",
+        mc_dropout=False,
+        dropout_rate=None,
+        apply_softmax=True
+):
+    """Using the model defined in model path, return the output values for
+    the given set of images"""
+
+    # Discover devices
+    device = discover_devices()
+
+    # Declare the model given model_type
+    cls = model_factory(model_type)
+    model_args = {
+        "cutout_size": cutout_size,
+        "channels": channels,
+        "num_classes": num_classes
+    }
+
+    if "drp" in model_type.split("_"):
+        logging.info(
+            "Using dropout rate of {} in the model".format(dropout_rate)
+        )
+        model_args["dropout"] = "True"
+
+    model = cls(**model_args)
+
+    # Load the model
+    logging.info("Loading model...")
+    if device == "cpu":
+        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    else:
+        model.load_state_dict(torch.load(model_path))
+
+
+    model = nn.DataParallel(model) if parallel else model
+    model = model.to(device)
+
+    # Changing the dropout rate if specified
+    if dropout_rate is not None:
+        specify_dropout_rate(model, dropout_rate)
+
+    # Set to evaluation mode
+    model.eval()
+
+    # If using Monte Carlo dropout, re-enable dropout layers
+    if mc_dropout:
+        enable_dropout(model)
+
+    # Create a data_preprocessing loader
+    loader = get_data_loader(
+        dataset,
+        batch_size=batch_size,
+        n_workers=n_workers,
+        shuffle=False,
+    )
+
+    # Acquiring GradCAM layer
+    targets = None  # None defaults to the highest scoring class
+    target_layers = [model.module.layer4] if parallel else [model.layer4]
+
+    os.makedirs(output_path, exist_ok=True)
+    global_img_idx = 0
+    logging.info("Performing heatmap creation...")
+
+    with EigenGradCAM(model=model, target_layers=target_layers) as cam:
+        cam.batch_size = batch_size
+
+        for data in tqdm(loader):
+            X, _ = data
+            X = X.to(device)
+
+            grayscale_cam = cam(input_tensor=X, targets=targets)
+
+            # Overlay and save the heatmaps
+            for i in range(X.size(0)):
+                # Bring the image tensor back to CPU and convert to numpy
+                img_tensor = X[i].cpu().numpy()
+
+                # Handle 3-channel (RGB) vs 1-channel (Grayscale fallback)
+                if channels == 3:
+                    # Permute from CHW to HWC
+                    img_bg = img_tensor.transpose(1, 2, 0)
+
+                    # Basic Min-Max normalization for standard RGB
+                    # (Note: For true Lupton RGB, you would use astropy.visualization.make_lupton_rgb here)
+                    img_normalized = (img_bg - img_bg.min()) / (img_bg.max() - img_bg.min() + 1e-8)
+                else:
+                    # Extract just the first channel (Channel 0)
+                    img_bg = img_tensor[0, :, :]
+                    img_normalized = (img_bg - img_bg.min()) / (img_bg.max() - img_bg.min() + 1e-8)
+                    # Convert single channel to 3-channel grayscale so show_cam_on_image can overlay
+                    img_normalized = cv2.cvtColor(img_normalized, cv2.COLOR_GRAY2RGB)
+
+                # Create the overlay
+                cam_image = show_cam_on_image(img_normalized, grayscale_cam[i, :], use_rgb=True)
+
+                # Save the image (converting RGB back to BGR for OpenCV)
+                save_file = os.path.join(output_path, f"heatmap_{global_img_idx:05d}.png")
+                cv2.imwrite(save_file, cv2.cvtColor(cam_image, cv2.COLOR_RGB2BGR))
+
+                global_img_idx += 1
+
+
+
+
+@click.command()
+@click.option(
+    "--model_type",
+    type=click.Choice(
+        [
+            "dragon"
+        ],
+        case_sensitive=False,
+    ),
+    default="dragon",
+)
+@click.option("--model_path", type=click.Path(exists=True), required=True)
+@click.option("--output_path", type=click.Path(writable=True), required=True)
+@click.option("--data_dir", type=click.Path(exists=True), required=True)
+@click.option("--cutout_size", type=int, default=167)
+@click.option("--channels", type=int, default=3)
+@click.option(
+    "--slug",
+    type=str,
+    required=True,
+    help="""This specifies which slug (balanced/unbalanced
+              xs, sm, lg, dev) is used to perform predictions on.""",
+)
+@click.option("--split", type=str, required=True, default="test")
+@click.option(
+    "--normalize/--no-normalize",
+    default=True,
+    help="""The normalize argument controls whether or not, the
+              loaded images will be normalized using the arsinh function""",
+)
+@click.option("--batch_size", type=int, default=256)
+@click.option(
+    "--n_workers",
+    type=int,
+    default=4,
+    help="""The number of workers to be used during the
+              data_preprocessing loading process.""",
+)
+@click.option(
+    "--parallel/--no-parallel",
+    default=True,
+    help="""The parallel argument controls whether or not
+              to use multiple GPUs when they are available""",
+)
+@click.option(
+    "--label_col",
+    type=str,
+    default="classes",
+    help="""Enter the label column(s) separated by commas. Note
+    that you should pass the exactly same argument for label_col
+    as was used during the training phase (of the model being used
+    for inference). """,
+)
+@click.option(
+    "--mc_dropout/--no-mc_dropout",
+    default=True,
+    help="""Turn on Monte Carlo dropout during inference.""",
+)
+@click.option(
+    "--n_runs",
+    type=int,
+    default=1,
+    help="""The number of times to run inference. This is helpful
+    when usng mc_dropout""",
+)
+@click.option("--n_classes", type=int, default=6)
+@click.option(
+    "--ini_run_num",
+    type=int,
+    default=1,
+    help="""The number of the first run. i.e. the output csv files
+    are named as (inf_run_num+iteration_number).csv""",
+)
+@click.option(
+    "--dropout_rate",
+    type=float,
+    default=None,
+    help="""The dropout rate to use for all the layers in the
+    model. If this is set to None, then the default dropout rate
+    in the specific model is used. This option should only be
+    used when you have used a non-default dropout rate during
+    training and have set --mc_dropout to True. The rate should
+    be set equal to the rate used during training.""",
+)
+@click.option(
+    "--crop /--no-crop",
+    default=True,
+    help="""If True, the images are passed through a cropping transformation
+to ensure proper cutout size""",
+)
+@click.option(
+    "--labels/--no-labels",
+    default=True,
+    help="""If True, this means you have labels available for the dataset.
+    If False, this means that you have no labels available and want to do
+    pure inference using a pre-trained model.""",
+)
+def main(
+    model_path,
+    output_path,
+    data_dir,
+    cutout_size,
+    channels,
+    parallel,
+    slug,
+    split,
+    normalize,
+    batch_size,
+    n_workers,
+    label_col,
+    model_type,
+    mc_dropout,
+    dropout_rate,
+    crop,
+    n_runs,
+    n_classes,
+    ini_run_num,
+    labels,
+):
+
+    logging.info(
+        """Creating full heatmaps. Using
+            column names to infer number of expected outputs.
+            Split and Slug values entered will be ignored and
+            info.csv will be used."""
+    )
+    split = None
+    slug = None
+
+    # Create label cols array
+    label_col_arr = label_col.split(",")
+
+    # Transforming the dataset to the proper cutout size
+    T = None
+    if crop:
+        T = K.CenterCrop(cutout_size)
+
+    # Test
+
+    # Load the data_preprocessing and create a data_preprocessing loader
+    logging.info("Loading images to device...")
+    dataset = FITSDataset(
+        data_dir,
+        slug=slug,
+        normalize=normalize,
+        split=split,
+        cutout_size=cutout_size,
+        channels=channels,
+        label_col=label_col_arr,
+        transforms=T,
+        load_labels=False
+    )
+
+    for run_num in range(ini_run_num, n_runs + ini_run_num):
+
+        logging.info(f"Running heatmap run {run_num}")
+
+        # Make predictions
+        heatmap(
+            model_path,
+            output_path,
+            dataset,
+            cutout_size,
+            channels,
+            parallel=parallel,
+            batch_size=batch_size,
+            n_workers=n_workers,
+            num_classes=n_classes,
+            model_type=model_type,
+            mc_dropout=mc_dropout,
+            dropout_rate=dropout_rate,
+        )
+
+
+
+if __name__ == "__main__":
+    log_fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_fmt)
+
+    main()

@@ -1,0 +1,192 @@
+import numpy as np
+from astropy.io import fits
+from astropy.table import Table
+from astropy.modeling.models import Gaussian2D, Sersic2D
+import glob
+from tqdm import tqdm
+import os
+from os.path import exists
+
+class DatasetCreator:
+    @staticmethod
+    def crop_center(img, cropx, cropy):
+        y, x, *_ = img.shape
+        startx = x // 2 - (cropx // 2)
+        starty = y // 2 - (cropy // 2)
+
+        return img[starty:starty + cropy, startx:startx + cropx, ...]
+
+    def make_random_galaxy_table(self, number, params, seed):
+        """
+        Generate a table of random galaxy parameters.
+        """
+        np.random.seed(seed)
+
+        table = Table()
+        for param_name, param_range in params.items():
+            param_values = np.random.uniform(param_range[0], param_range[1], size=number) #figure out why galaxies are only in the upper right corner
+            table[param_name] = param_values
+
+        return table
+
+    def make_galaxy_image(self, shape, galaxies):
+        """
+        Generate an image with galaxies using the provided parameters.
+        """
+        center_x = 30
+        center_y = 30 #make sure to later change the coordinates for the center of images when I update this code for 
+        #multiple sizes available.
+        exclusion_radius = 5
+        num_galaxies = len(galaxies)
+        image = np.zeros(shape)
+        side_length = int(np.ceil(np.sqrt(num_galaxies)))
+        num_rows = min(side_length, shape[0])
+        num_cols = min(side_length, shape[1])
+        # Calculate the spacing between galaxies
+        if num_rows != 0 and num_cols != 0:
+            row_spacing = shape[0] / num_rows
+            col_spacing = shape[1] / num_cols
+            for i, galaxy in enumerate(galaxies):
+                amplitude = galaxy['amplitude']
+                r_eff = galaxy['r_eff']
+                n = galaxy['n']
+                row = int(i/num_cols)
+                col = i%num_cols
+                y_0 = (row + 0.5)*row_spacing
+                x_0 = (col + 0.5)*col_spacing
+                if np.sqrt((x_0 - center_x)**2 + (y_0 - center_y)**2) <= exclusion_radius:
+                    return np.zeros(shape)
+                #x_0 = galaxy['x_0']
+                #y_0 = galaxy['y_0']
+                phi = galaxy['phi']
+                ellip = galaxy['ellipticity']
+
+                model = Sersic2D(amplitude=amplitude, r_eff=r_eff, n=n, x_0=x_0, y_0=y_0, ellip=ellip, theta = phi)
+                galaxy_image = model(*np.indices(shape))
+                img = image + galaxy_image
+                return img if num_galaxies != 0 else np.zeros(shape)
+        else:
+            pass
+    def addBackgroundGalaxies(self, image, number, flux, gain=1): #Adapted from Astropy.io: https://www.astropy.org/ccd-reduction-and-photometry-guide/v/dev/notebooks/01-03-Construction-of-an-artificial-but-realistic-image.html#add-some-stars
+        """
+        Add some background galaxies to make images less uniform and hopefully prevent the model from overfitting.
+        """
+        if number >= 0:
+            x_stddev = np.random.uniform(1.5, 3.0)
+            #print(x_stddev)
+            y_stddev = np.random.uniform(1.5, 3.0)
+            flux_range = [flux/20, flux]
+            amplitude_range = flux_range
+            r_eff_range = [1.0, 3.5]  # Effective radius range
+            n_range = [0.5, 4.0]  # Sersic index range
+            phi_range = [0, np.pi]  # Rotation angle range
+            ellipticity_range = [1.0, 3.5]  # Ellipticity range
+            y_max, x_max = image.shape
+            xmean_range_lower = [0.2 * x_max, 0.35 * x_max]
+            xmean_range_upper = [0.65*x_max, 0.8*x_max]
+            ymean_range_lower = [0.2 * y_max, 0.35 * y_max]
+            ymean_range_upper = [0.65*y_max, 0.8*y_max]
+            params_index = np.random.randint(0, high = 1, size = 1)
+            if params_index == 1:
+                params_lower = dict([('amplitude', flux_range),
+                            ('r_eff', r_eff_range),
+                            ('n', n_range),
+                            ('x_0', xmean_range_lower),
+                            ('y_0', ymean_range_lower),
+                            ('phi', phi_range),
+                            ('ellipticity', ellipticity_range)])
+                seed = np.random.randint(0, 10000)
+
+                sources = self.make_random_galaxy_table(number, params_lower, seed)
+
+                galaxy_im = self.make_galaxy_image(image.shape, sources)
+
+                return galaxy_im
+            elif params_index == 0:
+                params_upper = dict([('amplitude', flux_range),
+                            ('r_eff', r_eff_range),
+                            ('n', n_range),
+                            ('x_0', xmean_range_upper),
+                            ('y_0', ymean_range_upper),
+                            ('phi', phi_range),
+                            ('ellipticity', ellipticity_range)])
+                seed = np.random.randint(0, 10000)
+
+                sources = self.make_random_galaxy_table(number, params_upper, seed)
+
+                galaxy_im = self.make_galaxy_image(image.shape, sources)
+
+                return galaxy_im
+        else:
+            pass
+    def extract_single_galaxies(self, galaxy_filepath):
+        self.singleton_images = []
+        self.singleton_names = []
+        for ii, image in tqdm(enumerate(glob.glob(galaxy_filepath + "*.fits"))):
+            with fits.open(image, memmap = False) as hdul:
+                img = hdul[1].data
+                img = self.crop_center(img, 94, 94)
+                self.singleton_images.append(img)
+                last_backslash_index = image.rfind('//')
+
+                # Split the string from the last occurrence of the backslash
+                if last_backslash_index != -1:
+                    #parts_before_last_backslash.append(image[:last_backslash_index])
+                    self.singleton_names.append(image[last_backslash_index + 1:-4])
+                else:
+                    #print("Didnt work :(")
+                    #parts_before_last_backslash.append(image)
+                    self.singleton_names.append(f"Galaxy_{ii}")
+    def extract_single_point_sources(self, point_source_filepath):
+        self.single_point_sources = []
+        self.single_point_names = []
+        for ii, image in tqdm(enumerate(glob.glob(point_source_filepath + "*.fits"))):
+            with fits.open(image, memmap = False) as hdul:
+                img = hdul[1].data
+                img = self.crop_center(img, 94, 94)
+                self.single_point_sources.append(img)
+                self.single_point_names.append(f"{ii}")
+
+    def extract_rotated_AGN(self, rotated_AGN_filepath_prefix):
+        #asec_separations = ["2.0","1.9", "1.8", "1.7", "1.6", "1.4", "1.3", "1.2", "1.1","1.0", "0.8", "0.7", "0.6", "0.5"]
+        asec_separations = np.arange(0.5, 2.5, 0.05)
+        self.rotated_AGN = []
+        self.AGN_names = []
+        for j in tqdm(np.round(asec_separations, 2)):
+            for k, image in enumerate(glob.glob(rotated_AGN_filepath_prefix + str(j) + "_arcsecond_separations/downloaded_images/*.fits")):
+                with fits.open(image, memmap = False) as hdul:
+                    comp_img = hdul[1].data
+                    comp_img = self.crop_center(comp_img, 94, 94)
+                    #comp_img = np.expand_dims(comp_img, axis = -1)
+
+                    self.rotated_AGN.append(comp_img)
+                    # Find the last occurrence of the backslash
+                    last_backslash_index = image.rfind('//')
+
+                    # Split the string from the last occurrence of the backslash
+                    if last_backslash_index != -1:
+                        #parts_before_last_backslash.append(image[:last_backslash_index])
+                        self.AGN_names.append(image[last_backslash_index + 1:])
+                    else:
+                        #print("Didnt work :(")
+                        #parts_before_last_backslash.append(image)
+                        self.AGN_names.append(f"AGN_{k}")
+
+    def convolve_galaxy_AGN(self, galaxy_img, AGN_img):
+        convolved_image = galaxy_img + AGN_img
+        return convolved_image
+
+    def create_convolution(self, fits_filepath = "offset_AGN_images/"):
+        if not exists(fits_filepath):
+            os.makedirs(fits_filepath)
+        print(f"WRITING TO FILEPATH: {fits_filepath}")
+        for ii, galaxy_img in tqdm(enumerate(self.singleton_images)):
+            for j, AGN_img in enumerate(self.rotated_AGN):
+                convolved_image = self.convolve_galaxy_AGN(galaxy_img, AGN_img)
+                #print(np.shape(convolved_image))
+                #AGN_name = self.AGN_names[j]
+                #galaxy_name = self.singleton_names[ii]
+                hdu = fits.PrimaryHDU(convolved_image)
+                hdul = fits.HDUList([hdu])
+                #print(f"{fits_filepath}object{ii}_with_AGN_{j}.fits")
+                hdul.writeto(f"{fits_filepath}object{ii}_with_AGN_{j}.fits" , overwrite=True)
