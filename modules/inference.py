@@ -12,8 +12,13 @@ import kornia.augmentation as K
 
 from cnn import model_factory
 from utils import (
+    DEFAULT_ASINH_SOFTENING,
+    DEFAULT_HIGH_PERCENTILE,
+    DEFAULT_LOW_PERCENTILE,
+    asinh_normalize,
     discover_devices,
     enable_dropout,
+    load_asinh_stats,
     specify_dropout_rate,
     load_data_dir
 )
@@ -31,7 +36,9 @@ def predict(
     model_type="dragon",
     mc_dropout=False,
     dropout_rate=None,
-    apply_softmax=True
+    apply_softmax=True,
+    normalize=False,
+    normalization_kwargs=None,
 ):
     """Using the model defined in model path, return the output values for
     the given set of images"""
@@ -89,6 +96,10 @@ def predict(
         for data in tqdm(loader):
             X, _ = data
             X = X.to(device)
+            if dataset.transform is not None:
+                X = dataset.transform(X)
+            if normalize:
+                X = asinh_normalize(X, **(normalization_kwargs or {}))
             outputs = model(X)
             if apply_softmax:
                 outputs = nn.functional.softmax(outputs, dim=1)
@@ -138,8 +149,16 @@ def predict(
 @click.option(
     "--normalize/--no-normalize",
     default=True,
-    help="""The normalize argument controls whether or not, the
-              loaded images will be normalized using the arsinh function""",
+    help="Apply percentile clipping followed by a normalized asinh stretch.",
+)
+@click.option("--normalize-low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True)
+@click.option("--normalize-high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True)
+@click.option("--asinh-softening", type=float, default=DEFAULT_ASINH_SOFTENING, show_default=True)
+@click.option(
+    "--normalization-stats",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="JSON with the same per-channel vmin/vmax used during training.",
 )
 @click.option("--batch_size", type=int, default=256)
 @click.option(
@@ -218,6 +237,10 @@ def main(
     slug,
     split,
     normalize,
+    normalize_low_pct,
+    normalize_high_pct,
+    asinh_softening,
+    normalization_stats,
     batch_size,
     n_workers,
     label_col,
@@ -230,6 +253,23 @@ def main(
     ini_run_num,
     labels,
 ):
+
+    if not 0.0 <= normalize_low_pct < normalize_high_pct <= 100.0:
+        raise click.BadParameter(
+            "must satisfy 0 <= low < high <= 100",
+            param_hint="--normalize-low-pct/--normalize-high-pct",
+        )
+    if asinh_softening <= 0:
+        raise click.BadParameter("must be greater than zero", param_hint="--asinh-softening")
+
+    normalization_kwargs = {
+        "low_pct": normalize_low_pct,
+        "high_pct": normalize_high_pct,
+        "softening": asinh_softening,
+    }
+    if normalization_stats:
+        stats = load_asinh_stats(normalization_stats, channels=channels)
+        normalization_kwargs.update(vmin=stats["vmin"], vmax=stats["vmax"])
 
     logging.info(
         """Performing pure inference without labels. Using
@@ -281,6 +321,8 @@ def main(
             model_type=model_type,
             mc_dropout=mc_dropout,
             dropout_rate=dropout_rate,
+            normalize=normalize,
+            normalization_kwargs=normalization_kwargs,
         )
 
         # Write a CSV of predictions

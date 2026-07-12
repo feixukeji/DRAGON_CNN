@@ -1,4 +1,9 @@
 from .dataset import FITSDataset
+from .normalization import (
+    compute_asinh_stats,
+    load_or_compute_asinh_stats,
+    save_asinh_stats,
+)
 from torch.utils.data import DataLoader
 
 
@@ -20,4 +25,10 @@ def get_data_loader(dataset, batch_size, n_workers, shuffle=True, sampler=None):
     )
 
 
-__all__ = ["FITSDataset", "get_data_loader"]
+__all__ = [
+    "FITSDataset",
+    "get_data_loader",
+    "compute_asinh_stats",
+    "load_or_compute_asinh_stats",
+    "save_asinh_stats",
+]

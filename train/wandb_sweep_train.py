@@ -9,15 +9,25 @@ import subprocess
 
 import torch
 import torch.nn as nn
-import torch.optim as opt
 
 import kornia.augmentation as K
 import torch.multiprocessing as mp
 
-from data_preprocessing import FITSDataset, get_data_loader
+from data_preprocessing import (
+    FITSDataset,
+    get_data_loader,
+    load_or_compute_asinh_stats,
+)
 from cnn import model_factory, model_stats, save_trained_model
 from train import create_trainer, create_transfer_learner
-from utils import discover_devices, specify_dropout_rate
+from utils import (
+    DEFAULT_ASINH_SOFTENING,
+    DEFAULT_HIGH_PERCENTILE,
+    DEFAULT_LOW_PERCENTILE,
+    build_optimizer,
+    discover_devices,
+    specify_dropout_rate,
+)
 
 # Global Sweep Configuration. This also effects early stopping
 # for bad runs!
@@ -116,6 +126,15 @@ to what fraction is picked for train/devel/test.""",
 @click.option("--cutout_size", type=int, default=167)
 @click.option("--channels", type=int, default=1)
 @click.option(
+    "--optimizer",
+    type=click.Choice(["sgd", "adamw"], case_sensitive=False),
+    default="sgd",
+    show_default=True,
+)
+@click.option("--adamw-beta1", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.9, show_default=True)
+@click.option("--adamw-beta2", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.999, show_default=True)
+@click.option("--adamw-eps", type=click.FloatRange(min=0.0, min_open=True), default=1e-8, show_default=True)
+@click.option(
     "--n_workers",
     type=int,
     default=4,
@@ -131,9 +150,23 @@ to use multiple GPUs when they are available""",
 @click.option(
     "--normalize/--no-normalize",
     default=True,
-    help="""The normalize argument controls whether or not, the
-loaded images will be normalized using the arsinh function""",
+    help="Apply percentile clipping followed by a normalized asinh stretch.",
 )
+@click.option("--normalize-low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True)
+@click.option("--normalize-high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True)
+@click.option("--asinh-softening", type=float, default=DEFAULT_ASINH_SOFTENING, show_default=True)
+@click.option(
+    "--normalization-stats",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Euclid-style JSON with fixed per-channel vmin/vmax. A missing file "
+        "is computed from the training split and saved."
+    ),
+)
+@click.option("--normalization-sample-per-image", type=int, default=1000, show_default=True)
+@click.option("--normalization-max-samples", type=int, default=2000000, show_default=True)
+@click.option("--normalization-seed", type=int, default=42, show_default=True)
 @click.option("--n_classes", type=int, default=6)
 @click.option(
     "--loss",
@@ -164,9 +197,47 @@ to the cutout_size parameter""",
     help="""Specifies whether you wish to do transfer learning. If transfer learning,
     you must specify model path in the model_state argument."""
 )
+@click.option(
+    "--unfreeze-warmup-epochs",
+    type=click.IntRange(min=0),
+    default=3,
+    show_default=True,
+)
+@click.option(
+    "--unfreeze-blocks-per-epoch",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+)
 def sweep_init(**kwargs):
     # Copy and log args
     args = {k: v for k, v in kwargs.items()}
+
+    if not 0.0 <= args["normalize_low_pct"] < args["normalize_high_pct"] <= 100.0:
+        raise click.BadParameter(
+            "must satisfy 0 <= low < high <= 100",
+            param_hint="--normalize-low-pct/--normalize-high-pct",
+        )
+    if args["asinh_softening"] <= 0:
+        raise click.BadParameter("must be greater than zero", param_hint="--asinh-softening")
+    if args["normalization_sample_per_image"] < 0 or args["normalization_max_samples"] < 0:
+        raise click.BadParameter(
+            "must be non-negative",
+            param_hint="--normalization-sample-per-image/--normalization-max-samples",
+        )
+
+    normalization_kwargs = {
+        "low_pct": args["normalize_low_pct"],
+        "high_pct": args["normalize_high_pct"],
+        "softening": args["asinh_softening"],
+    }
+    if not args["normalize"]:
+        args["normalization_mode"] = "disabled"
+    elif args["normalization_stats"]:
+        args["normalization_mode"] = "global"
+    else:
+        args["normalization_mode"] = "per_cutout"
+    args["normalization_kwargs"] = normalization_kwargs
 
     # Discover devices
     args["device"] = discover_devices()
@@ -195,6 +266,23 @@ def sweep_init(**kwargs):
         )
         for k in splits
     }
+
+    if args["normalize"] and args["normalization_stats"]:
+        stats, computed = load_or_compute_asinh_stats(
+            args["normalization_stats"],
+            datasets["train"],
+            channels=args["channels"],
+            low_pct=args["normalize_low_pct"],
+            high_pct=args["normalize_high_pct"],
+            sample_per_image=args["normalization_sample_per_image"],
+            max_samples_per_channel=args["normalization_max_samples"],
+            seed=args["normalization_seed"],
+        )
+        action = "Computed and saved" if computed else "Loaded"
+        logging.info(f'{action} normalization stats: {args["normalization_stats"]}')
+        normalization_kwargs.update(vmin=stats["vmin"], vmax=stats["vmax"])
+        args["normalization_vmin"] = stats["vmin"]
+        args["normalization_vmax"] = stats["vmax"]
 
     # Select the desired transforms
     T = None
@@ -306,12 +394,16 @@ def train(model_cls, datasets, criterion, args):
             else:
                 model.load_state_dict(torch.load(args["model_state"]))
 
-        optimizer = opt.SGD(
-            model.parameters(),
+        optimizer = build_optimizer(
+            model,
+            optimizer_name=args["optimizer"],
             lr=wandb.config.learning_rate,
+            weight_decay=wandb.config.weight_decay,
             momentum=wandb.config.momentum,
             nesterov=wandb.config.nesterov,
-            weight_decay=wandb.config.weight_decay
+            adamw_beta1=args["adamw_beta1"],
+            adamw_beta2=args["adamw_beta2"],
+            adamw_eps=args["adamw_eps"],
         )
 
         # Create a DataLoader factory based on command-line args
@@ -333,12 +425,32 @@ def train(model_cls, datasets, criterion, args):
         if args["train"]:
             logging.info("Creating trainer...")
             trainer = create_trainer(
-                model, optimizer, criterion, loaders, args["device"], wandb.config.scheduler
+                model,
+                optimizer,
+                criterion,
+                loaders,
+                args["device"],
+                wandb.config.scheduler,
+                gpu_transforms=datasets["train"].transform,
+                eval_gpu_transforms=datasets["devel"].transform,
+                normalize=args["normalize"],
+                normalization_kwargs=args["normalization_kwargs"],
             )
         else:
             logging.info("Creating trainer and freezing layers for transfer learning...")
             trainer = create_transfer_learner(
-                model, optimizer, criterion, loaders, args["device"], wandb.config.scheduler
+                model,
+                optimizer,
+                criterion,
+                loaders,
+                args["device"],
+                wandb.config.scheduler,
+                gpu_transforms=datasets["train"].transform,
+                eval_gpu_transforms=datasets["devel"].transform,
+                normalize=args["normalize"],
+                normalization_kwargs=args["normalization_kwargs"],
+                unfreeze_warmup_epochs=args["unfreeze_warmup_epochs"],
+                unfreeze_blocks_per_epoch=args["unfreeze_blocks_per_epoch"],
             )
 
         # Run trainer and save model state

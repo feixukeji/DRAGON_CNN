@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
+import re
 
+import torch
 import wandb
 
 from ignite.engine import (
@@ -16,7 +18,67 @@ import logging
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from utils import arsinh_normalize
+from utils import asinh_normalize
+
+
+class GradualBackboneUnfreezer:
+    """Freeze and unfreeze complete ``layerN`` backbone blocks."""
+
+    @staticmethod
+    def _force_eval(module, _inputs):
+        module.eval()
+
+    def __init__(self, model):
+        parallel_types = (
+            torch.nn.DataParallel,
+            torch.nn.parallel.DistributedDataParallel,
+        )
+        self.model = model.module if isinstance(model, parallel_types) else model
+        backbone_root = self.model
+        blocks = [
+            (name, module)
+            for name, module in backbone_root.named_children()
+            if re.fullmatch(r"layer\d+", name)
+        ]
+        # The optional ResNet wrapper stores layer1...layer4 under ``model``.
+        if not blocks and hasattr(self.model, "model"):
+            backbone_root = self.model.model
+            blocks = [
+                (name, module)
+                for name, module in backbone_root.named_children()
+                if re.fullmatch(r"layer\d+", name)
+            ]
+        if not blocks:
+            raise ValueError("Transfer learning requires backbone blocks named layerN.")
+
+        # Unfreeze from the task-specific end of the backbone toward the input.
+        self._frozen_blocks = sorted(
+            blocks, key=lambda item: int(item[0].removeprefix("layer")), reverse=True
+        )
+        self._eval_hooks = {}
+        for name, module in self._frozen_blocks:
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+            # model.train() would otherwise keep updating frozen BatchNorm buffers.
+            self._eval_hooks[name] = module.register_forward_pre_hook(
+                self._force_eval
+            )
+
+    @property
+    def frozen_block_names(self):
+        return [name for name, _ in self._frozen_blocks]
+
+    def unfreeze_next(self, count=1):
+        """Unfreeze up to ``count`` complete blocks and return their names."""
+        unfrozen = []
+        for _ in range(min(count, len(self._frozen_blocks))):
+            name, module = self._frozen_blocks.pop(0)
+            self._eval_hooks.pop(name).remove()
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+            module.train()
+            unfrozen.append(name)
+        return unfrozen
 
 
 def _to_float(value):
@@ -31,12 +93,13 @@ def _to_float(value):
 
 
 def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=True, gpu_transforms=None,
-                   normalize=False, checkpoint_dir=None, run_id=None, num_epochs=32, run_dir=None):
-    """Set up Ignite trainer and evaluator with GPU transforms."""
+                   normalize=False, checkpoint_dir=None, run_id=None, num_epochs=32, run_dir=None,
+                   eval_gpu_transforms=None, normalization_kwargs=None):
+    """Set up Ignite trainer with train-only augmentation and deterministic evaluation."""
 
 
     # 1. Define the custom batch preparation function
-    def custom_prepare_batch(batch, device, non_blocking):
+    def custom_prepare_batch(batch, device, non_blocking, transforms):
         x, y = batch
 
         # Move the raw batch to the GPU first
@@ -44,18 +107,24 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
         y = y.to(device, non_blocking=non_blocking)
 
         # Apply transformations on the GPU to the whole batch (B, C, H, W)
-        if gpu_transforms is not None:
-            if hasattr(gpu_transforms, "__len__"):
-                for transform in gpu_transforms:
+        if transforms is not None:
+            if hasattr(transforms, "__len__"):
+                for transform in transforms:
                     x = transform(x)
             else:
-                x = gpu_transforms(x)
+                x = transforms(x)
 
         # Apply normalization on the GPU
         if normalize:
-            x = arsinh_normalize(x)  # Ensure this function supports batched tensors!
+            x = asinh_normalize(x, **(normalization_kwargs or {}))
 
         return x, y
+
+    def prepare_train_batch(batch, device, non_blocking):
+        return custom_prepare_batch(batch, device, non_blocking, gpu_transforms)
+
+    def prepare_eval_batch(batch, device, non_blocking):
+        return custom_prepare_batch(batch, device, non_blocking, eval_gpu_transforms)
 
     # Define a score function.
     # If using Accuracy (higher is better):
@@ -65,7 +134,7 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
     # 2. Pass the custom function to the trainer
     trainer = create_supervised_trainer(
         model, optimizer, criterion, device=device,
-        prepare_batch=custom_prepare_batch,
+        prepare_batch=prepare_train_batch,
         amp_mode="amp"
     )
 
@@ -91,7 +160,7 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
 
     evaluator = create_supervised_evaluator(
         model, metrics=metrics, device=device,
-        prepare_batch=custom_prepare_batch,
+        prepare_batch=prepare_eval_batch,
         amp_mode="amp"
     )
 
@@ -235,18 +304,23 @@ def create_transfer_learner(
     run_id=None,
     num_epochs=32,
     run_dir=None,
+    eval_gpu_transforms=None,
+    normalization_kwargs=None,
+    unfreeze_warmup_epochs=3,
+    unfreeze_blocks_per_epoch=1,
 ):
-    """Method to create a transfer learner trainer."""
+    """Create a transfer learner with deterministic block-wise unfreezing."""
+    if unfreeze_warmup_epochs < 0:
+        raise ValueError("unfreeze_warmup_epochs must be non-negative.")
+    if unfreeze_blocks_per_epoch <= 0:
+        raise ValueError("unfreeze_blocks_per_epoch must be greater than zero.")
 
-    # Initialize a stack that contains all frozen layers.
-    frozen_layer_stack = []
-
-    # Initial freezing of the layers.
-    logging.info("Freezing non-FC layers for given model...")
-    for name, param in model.named_parameters():
-        if "fc" not in name:
-            param.requires_grad = False
-            frozen_layer_stack.append((name, param))
+    unfreezer = GradualBackboneUnfreezer(model)
+    logging.info(
+        "Frozen backbone blocks: %s. Training classifier head for %d epoch(s).",
+        ", ".join(unfreezer.frozen_block_names),
+        unfreeze_warmup_epochs,
+    )
 
     # Create trainer
     trainer = create_trainer(
@@ -262,24 +336,42 @@ def create_transfer_learner(
         run_id,
         num_epochs,
         run_dir,
+        eval_gpu_transforms,
+        normalization_kwargs,
     )
 
-    # Gradual unfreezing of layers based on epoch.
-    @trainer.on(Events.EPOCH_COMPLETED)
-    def unfreeze_layers(engine):
-        epoch = engine.state.epoch
+    if unfreeze_warmup_epochs == 0:
+        for block_name in unfreezer.unfreeze_next(unfreeze_blocks_per_epoch):
+            logging.info("Unfroze backbone block %s before epoch 1.", block_name)
 
-        # We unfreeze one entire layer at a time (O(1) complexity).
-        wandb.log({"frozen_layers": len(frozen_layer_stack)})
-        if frozen_layer_stack:
-            top_name, top_param = frozen_layer_stack[-1]
-            layer_name = top_name.split('.')[1]
-            while frozen_layer_stack and frozen_layer_stack[-1][0].split('.')[1] == layer_name:
-                name, param = frozen_layer_stack.pop()
-                param.requires_grad = True
-                logging.info(f"Epoch[{epoch}]: layer {name} is now trainable.")
-        else:
-            # All layers unfrozen already!
-            logging.info(f"Epoch[{epoch}]: all layers trainable.")
+    # Unfreeze complete blocks after the configured head-only warmup.
+    reported_all_trainable = False
+
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def unfreeze_backbone_blocks(engine):
+        nonlocal reported_all_trainable
+        epoch = engine.state.epoch
+        unfrozen = []
+        if epoch >= max(1, unfreeze_warmup_epochs):
+            unfrozen = unfreezer.unfreeze_next(unfreeze_blocks_per_epoch)
+            for block_name in unfrozen:
+                logging.info(
+                    "Epoch[%d]: backbone block %s is now trainable.",
+                    epoch,
+                    block_name,
+                )
+
+        if wandb.run is not None:
+            wandb.log(
+                {
+                    "frozen_blocks": len(unfreezer.frozen_block_names),
+                    "newly_unfrozen_blocks": ",".join(unfrozen),
+                },
+                step=epoch,
+            )
+
+        if not unfreezer.frozen_block_names and not reported_all_trainable:
+            logging.info("Epoch[%d]: all backbone blocks are trainable.", epoch)
+            reported_all_trainable = True
 
     return trainer

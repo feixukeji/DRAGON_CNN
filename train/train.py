@@ -10,14 +10,24 @@ import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as opt
 
 import kornia.augmentation as K
 
-from data_preprocessing import FITSDataset, get_data_loader
+from data_preprocessing import (
+    FITSDataset,
+    get_data_loader,
+    load_or_compute_asinh_stats,
+)
 from cnn import model_factory, model_stats, save_trained_model
 from create_trainer import create_trainer, create_transfer_learner
-from utils import discover_devices, specify_dropout_rate
+from utils import (
+    DEFAULT_ASINH_SOFTENING,
+    DEFAULT_HIGH_PERCENTILE,
+    DEFAULT_LOW_PERCENTILE,
+    build_optimizer,
+    discover_devices,
+    specify_dropout_rate,
+)
 
 
 import random
@@ -55,6 +65,35 @@ class ClassWeightedNLLLoss(ClassWeightedCrossEntropyLoss):
     def forward(self, input, target):
         weight = self._weight_for(input)
         return F.nll_loss(input, target, weight=weight)
+
+
+class RandomDihedralAugmentation(nn.Module):
+    """Apply one of four right-angle rotations and an optional horizontal flip."""
+
+    def forward(self, images):
+        if images.ndim != 4:
+            raise ValueError(
+                f"Expected a (batch, channels, height, width) tensor, got {images.shape}"
+            )
+
+        transform_ids = torch.randint(0, 8, (images.shape[0],), device=images.device)
+        augmented = torch.empty_like(images)
+
+        for transform_id in range(8):
+            mask = transform_ids == transform_id
+            if not torch.any(mask):
+                continue
+
+            transformed = images[mask]
+            if transform_id >= 4:
+                transformed = torch.flip(transformed, dims=(-1,))
+            augmented[mask] = torch.rot90(
+                transformed,
+                k=transform_id % 4,
+                dims=(-2, -1),
+            )
+
+        return augmented
 
 
 @click.command()
@@ -124,9 +163,26 @@ data_preprocessing loading process.""",
 )
 @click.option("--batch_size", type=int, default=16)
 @click.option("--epochs", type=int, default=40)
-@click.option("--lr", type=float, default=5e-7)
+@click.option(
+    "--lr0",
+    "--lr",
+    "lr0",
+    type=float,
+    default=5e-7,
+    show_default=True,
+    help="Initial learning rate; --lr is retained as a compatibility alias.",
+)
 @click.option("--momentum", type=float, default=0.9)
 @click.option("--weight_decay", type=float, default=0)
+@click.option(
+    "--optimizer",
+    type=click.Choice(["sgd", "adamw"], case_sensitive=False),
+    default="sgd",
+    show_default=True,
+)
+@click.option("--adamw-beta1", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.9, show_default=True)
+@click.option("--adamw-beta2", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.999, show_default=True)
+@click.option("--adamw-eps", type=click.FloatRange(min=0.0, min_open=True), default=1e-8, show_default=True)
 @click.option(
     "--parallel/--no-parallel",
     default=True,
@@ -136,9 +192,24 @@ to use multiple GPUs when they are available""",
 @click.option(
     "--normalize/--no-normalize",
     default=True,
-    help="""The normalize argument controls whether or not, the
-loaded images will be normalized using the arsinh function""",
+    help="Apply percentile clipping followed by a normalized asinh stretch.",
 )
+@click.option("--normalize-low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True)
+@click.option("--normalize-high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True)
+@click.option("--asinh-softening", type=float, default=DEFAULT_ASINH_SOFTENING, show_default=True)
+@click.option(
+    "--normalization-stats",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Euclid-style JSON containing per-channel vmin/vmax. If the path does "
+        "not exist, statistics are computed from the training split and saved. "
+        "If omitted, percentiles are computed per cutout/channel."
+    ),
+)
+@click.option("--normalization-sample-per-image", type=int, default=1000, show_default=True)
+@click.option("--normalization-max-samples", type=int, default=2000000, show_default=True)
+@click.option("--normalization-seed", type=int, default=42, show_default=True)
 @click.option(
     "--crop/--no-crop",
     default=True,
@@ -171,10 +242,29 @@ to the cutout_size parameter""",
 data is augmented""",
 )
 @click.option(
+    "--augment/--no-augment",
+    default=True,
+    help="Randomly apply one of the eight right-angle rotation/horizontal-flip transforms to each training sample.",
+)
+@click.option(
     "--train/--transfer_learn",
     default=True,
     help="""Specifies whether you wish to do transfer learning. If transfer learning,
     you must specify model path in the model_state argument."""
+)
+@click.option(
+    "--unfreeze-warmup-epochs",
+    type=click.IntRange(min=0),
+    default=3,
+    show_default=True,
+    help="Head-only epochs before unfreezing the first backbone block.",
+)
+@click.option(
+    "--unfreeze-blocks-per-epoch",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Complete layerN backbone blocks to unfreeze after each epoch.",
 )
 @click.option(
     "--scheduler/--no_scheduler",
@@ -191,6 +281,31 @@ def train(**kwargs):
 
     # Copy and log args
     args = {k: v for k, v in kwargs.items()}
+
+    if not 0.0 <= args["normalize_low_pct"] < args["normalize_high_pct"] <= 100.0:
+        raise click.BadParameter(
+            "must satisfy 0 <= low < high <= 100",
+            param_hint="--normalize-low-pct/--normalize-high-pct",
+        )
+    if args["asinh_softening"] <= 0:
+        raise click.BadParameter("must be greater than zero", param_hint="--asinh-softening")
+    if args["normalization_sample_per_image"] < 0 or args["normalization_max_samples"] < 0:
+        raise click.BadParameter(
+            "must be non-negative",
+            param_hint="--normalization-sample-per-image/--normalization-max-samples",
+        )
+
+    normalization_kwargs = {
+        "low_pct": args["normalize_low_pct"],
+        "high_pct": args["normalize_high_pct"],
+        "softening": args["asinh_softening"],
+    }
+    if not args["normalize"]:
+        args["normalization_mode"] = "disabled"
+    elif args["normalization_stats"]:
+        args["normalization_mode"] = "global"
+    else:
+        args["normalization_mode"] = "per_cutout"
 
     # Discover devices
     args["device"] = discover_devices()
@@ -235,14 +350,18 @@ def train(**kwargs):
         else:
             model.load_state_dict(torch.load(args["model_state"]))
 
-    # Define the optimizer
-    optimizer = opt.SGD(
-        model.parameters(),
-        lr=args["lr"],
+    optimizer = build_optimizer(
+        model,
+        optimizer_name=args["optimizer"],
+        lr=args["lr0"],
+        weight_decay=args["weight_decay"],
         momentum=args["momentum"],
         nesterov=args["nesterov"],
-        weight_decay=args["weight_decay"],
+        adamw_beta1=args["adamw_beta1"],
+        adamw_beta2=args["adamw_beta2"],
+        adamw_eps=args["adamw_eps"],
     )
+    logging.info("Using %s optimizer with lr=%g.", args["optimizer"].upper(), args["lr0"])
 
     # Create a DataLoader factory based on command-line args
     loader_factory = partial(
@@ -251,13 +370,16 @@ def train(**kwargs):
         n_workers=args["n_workers"],
     )
 
-    # Select the desired transforms
-    T = None
+    # Keep deterministic preprocessing separate from train-only random augmentation.
+    eval_transforms = []
     if args["crop"]:
-        T = [K.CenterCrop(args["cutout_size"]),
-            K.RandomHorizontalFlip(),
-            K.RandomVerticalFlip(),
-            K.RandomRotation(360)]
+        eval_transforms.append(K.CenterCrop(args["cutout_size"]))
+    train_transforms = list(eval_transforms)
+    if args["augment"]:
+        train_transforms.append(RandomDihedralAugmentation())
+
+    train_transforms = train_transforms or None
+    eval_transforms = eval_transforms or None
 
     # Generate the DataLoaders and log the train/devel/test split sizes
     splits = ("train", "devel", "test")
@@ -268,7 +390,7 @@ def train(**kwargs):
             cutout_size=args["cutout_size"],
             channels=args["channels"],
             normalize=args["normalize"],
-            transforms=T,
+            transforms=None,
             split=k,
             num_classes=args["n_classes"],
             expand_factor=args["expand_data"] if k == "train" else 1,
@@ -276,6 +398,24 @@ def train(**kwargs):
         )
         for k in splits
     }
+
+    if args["normalize"] and args["normalization_stats"]:
+        stats, computed = load_or_compute_asinh_stats(
+            args["normalization_stats"],
+            datasets["train"],
+            channels=args["channels"],
+            low_pct=args["normalize_low_pct"],
+            high_pct=args["normalize_high_pct"],
+            sample_per_image=args["normalization_sample_per_image"],
+            max_samples_per_channel=args["normalization_max_samples"],
+            seed=args["normalization_seed"],
+        )
+        action = "Computed and saved" if computed else "Loaded"
+        logging.info(f'{action} normalization stats: {args["normalization_stats"]}')
+        normalization_kwargs.update(vmin=stats["vmin"], vmax=stats["vmax"])
+        args["normalization_vmin"] = stats["vmin"]
+        args["normalization_vmax"] = stats["vmax"]
+
     loaders = {k: loader_factory(v, shuffle=(k == 'train')) for k, v in datasets.items()}
     args["splits"] = {k: len(v.dataset) for k, v in loaders.items()}
 
@@ -311,10 +451,14 @@ def train(**kwargs):
             "num_classes": args["n_classes"],
             "architecture": "CNN",
             "parameters": {
-                "learning_rate": args["lr"],
+                "initial_learning_rate": args["lr0"],
+                "optimizer": args["optimizer"],
                 "momentum": args["momentum"],
                 "nesterov": args["nesterov"],
                 "weight_decay": args["weight_decay"],
+                "adamw_beta1": args["adamw_beta1"],
+                "adamw_beta2": args["adamw_beta2"],
+                "adamw_eps": args["adamw_eps"],
                 "epochs": args["epochs"],
                 "batch_size": args["batch_size"]
             }
@@ -342,6 +486,10 @@ def train(**kwargs):
                 loaders,
                 args["device"],
                 args["scheduler"],
+                gpu_transforms=train_transforms,
+                eval_gpu_transforms=eval_transforms,
+                normalize=args["normalize"],
+                normalization_kwargs=normalization_kwargs,
                 checkpoint_dir=checkpoint_dir,
                 run_id=run.id,
                 num_epochs=args["epochs"],
@@ -356,6 +504,12 @@ def train(**kwargs):
                 loaders,
                 args["device"],
                 args["scheduler"],
+                gpu_transforms=train_transforms,
+                eval_gpu_transforms=eval_transforms,
+                normalize=args["normalize"],
+                normalization_kwargs=normalization_kwargs,
+                unfreeze_warmup_epochs=args["unfreeze_warmup_epochs"],
+                unfreeze_blocks_per_epoch=args["unfreeze_blocks_per_epoch"],
                 checkpoint_dir=checkpoint_dir,
                 run_id=run.id,
                 num_epochs=args["epochs"],

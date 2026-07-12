@@ -112,24 +112,80 @@ python train/train.py \
 	--channels 3 \
 	--n_classes 6 \
 	--epochs 40 \
-	--batch_size 16
+	--batch_size 16 \
+	--optimizer sgd
 ```
 
 Key behavior:
 - Saves checkpoints to checkpoints/ and final weights to models/.
-- Uses arsinh normalization when --normalize is enabled (default true).
+- With `--normalize` (the default), applies the Euclid YOLO stretch independently
+  to each cutout/channel: clip at the 0.5/99.5 percentiles, map to `[0, 1]`, then
+  apply `asinh(x / 0.1) / asinh(1 / 0.1)`.
 - Uses Kornia GPU augmentations when --crop is enabled.
 - Training expects a label column named class in info.csv by default.
+
+The optimizer can be selected without changing code:
+
+```bash
+# Momentum SGD (the default)
+python train/train.py ... --optimizer sgd --lr0 1e-3 --momentum 0.9 --nesterov
+
+# AdamW; momentum/nesterov are ignored
+python train/train.py ... --optimizer adamw --lr0 3e-5 --weight_decay 1e-4
+```
+
+AdamW uses `--adamw-beta1`, `--adamw-beta2`, and `--adamw-eps`; bias and
+normalization parameters are excluded from weight decay.
+
+The percentile limits and softening are configurable with
+`--normalize-low-pct`, `--normalize-high-pct`, and `--asinh-softening`.
+For fixed limits shared by every cutout, pass a statistics path. Training loads
+the file if it exists; otherwise it automatically computes per-channel limits
+from the training split only and saves the file:
+
+```bash
+python train/train.py \
+	--data_dir /path/to/data_dir \
+	--split_slug balanced-dev \
+	--channels 3 \
+	--normalization-stats /path/to/data_dir/normalization_stats.json
+```
+
+Statistics can also be generated explicitly before training:
+
+```bash
+python -m data_preprocessing.compute_normalization_stats \
+	--data-dir /path/to/data_dir \
+	--split-slug balanced-dev \
+	--split train \
+	--channels 3 \
+	--output /path/to/data_dir/normalization_stats.json
+```
+
+The JSON format is compatible with `Euclid_Q1/YOLO/fits_to_tiff.py` and must
+contain per-channel `vmin` and `vmax` arrays. Models trained with the former
+raw `asinh(x)` preprocessing need retraining before using this normalized
+stretch. Inference and heatmap commands require this training-time file to
+already exist; they never recompute statistics from inference data.
 
 Transfer learning:
 
 ```bash
 python train/train.py \
 	--transfer_learn \
+	--unfreeze-warmup-epochs 3 \
+	--unfreeze-blocks-per-epoch 1 \
+	--lr0 2e-5 \
 	--model_state /path/to/model.pt \
 	--data_dir /path/to/data_dir \
 	--split_slug balanced-dev
 ```
+
+Transfer learning first trains `fc1`/`fc2` only, then unfreezes complete
+backbone blocks from `layer8` toward `layer1`. Frozen blocks keep BatchNorm
+parameters and running statistics fixed. With the defaults above, `layer8` is
+unfrozen after epoch 3 and all eight backbone blocks are trainable from epoch
+11 onward.
 
 W&B hyperparameter sweeps:
 
