@@ -165,8 +165,8 @@ python -m data_preprocessing.compute_normalization_stats \
 The JSON format is compatible with `Euclid_Q1/YOLO/fits_to_tiff.py` and must
 contain per-channel `vmin` and `vmax` arrays. Models trained with the former
 raw `asinh(x)` preprocessing need retraining before using this normalized
-stretch. Inference and heatmap commands require this training-time file to
-already exist; they never recompute statistics from inference data.
+stretch. Inference requires this training-time file to already exist and never
+recomputes statistics from inference data.
 
 Transfer learning:
 
@@ -178,14 +178,18 @@ python train/train.py \
 	--lr0 2e-5 \
 	--model_state /path/to/model.pt \
 	--data_dir /path/to/data_dir \
-	--split_slug balanced-dev
+	--split_slug balanced-dev \
+	--normalize \
+	--normalization-stats /path/to/run/normalization_stats.json
 ```
 
 Transfer learning first trains `fc1`/`fc2` only, then unfreezes complete
 backbone blocks from `layer8` toward `layer1`. Frozen blocks keep BatchNorm
 parameters and running statistics fixed. With the defaults above, `layer8` is
 unfrozen after epoch 3 and all eight backbone blocks are trainable from epoch
-11 onward.
+11 onward. Transfer learning requires fixed asinh normalization. If the JSON
+does not yet exist, it is computed from the transfer-learning training split
+and saved; `--no-normalize` and an omitted `--normalization-stats` are rejected.
 
 W&B hyperparameter sweeps:
 
@@ -200,23 +204,28 @@ The sweep entrypoint supports both dragon and resnet model types.
 
 ## Inference
 
-The inference script runs in a no-labels mode and writes prediction CSVs. The output_path argument is treated as a filename prefix, so provide a directory path ending in a slash if you want files inside a folder.
+The inference script runs in a no-labels mode and always applies the fixed
+asinh limits from the training run. Pass the JSON explicitly, or place it at
+`DATA_DIR/normalization_stats.json`. Inference fails instead of falling back to
+per-cutout statistics or unnormalized images.
 
 ```bash
 python modules/inference.py \
-	--model_path models/dragon-balanced-dev-XXXXX.pt \
-	--output_path /path/to/output/ \
-	--data_dir /path/to/data_dir \
-	--slug balanced-dev \
-	--split test \
-	--cutout_size 94 \
+	--model-path models/dragon-balanced-dev-XXXXX.pt \
+	--output-dir /path/to/output \
+	--data-dir /path/to/data_dir \
+	--normalization-stats /path/to/run/normalization_stats.json \
+	--cutout-size 94 \
 	--channels 3 \
-	--n_classes 6 \
-	--batch_size 256 \
-	--mc_dropout
+	--n-classes 6 \
+	--batch-size 256 \
+	--no_mc_dropout
 ```
 
-Outputs include predicted_labels, predicted_confidence, and the second best class/confidence for each object.
+The command writes `inf_1.csv` with the top two class indices and confidences.
+When `DATA_DIR/labels.csv` is present, it also adds class names and writes
+`summary_counts.csv`. The legacy underscore option names and `--output_path`
+filename prefix remain accepted.
 
 ## Heatmaps (Grad-CAM)
 

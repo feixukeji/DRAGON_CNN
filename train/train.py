@@ -26,7 +26,9 @@ from utils import (
     DEFAULT_LOW_PERCENTILE,
     build_optimizer,
     discover_devices,
+    load_model_state,
     specify_dropout_rate,
+    validate_transfer_learning_options,
 )
 
 
@@ -204,7 +206,8 @@ to use multiple GPUs when they are available""",
     help=(
         "Euclid-style JSON containing per-channel vmin/vmax. If the path does "
         "not exist, statistics are computed from the training split and saved. "
-        "If omitted, percentiles are computed per cutout/channel."
+        "Transfer learning requires this option; regular training falls back "
+        "to per-cutout/channel percentiles when it is omitted."
     ),
 )
 @click.option("--normalization-sample-per-image", type=int, default=1000, show_default=True)
@@ -282,6 +285,16 @@ def train(**kwargs):
     # Copy and log args
     args = {k: v for k, v in kwargs.items()}
 
+    try:
+        validate_transfer_learning_options(
+            is_training=args["train"],
+            model_state=args["model_state"],
+            normalize=args["normalize"],
+            normalization_stats=args["normalization_stats"],
+        )
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
     if not 0.0 <= args["normalize_low_pct"] < args["normalize_high_pct"] <= 100.0:
         raise click.BadParameter(
             "must satisfy 0 <= low < high <= 100",
@@ -345,10 +358,7 @@ def train(**kwargs):
     # Load the model from a saved state if provided
     if args["model_state"]:
         logging.info(f'Loading model from {args["model_state"]}...')
-        if args["device"] == "cpu":
-            model.load_state_dict(torch.load(args["model_state"], map_location="cpu"))
-        else:
-            model.load_state_dict(torch.load(args["model_state"]))
+        load_model_state(model, args["model_state"], device=args["device"])
 
     optimizer = build_optimizer(
         model,

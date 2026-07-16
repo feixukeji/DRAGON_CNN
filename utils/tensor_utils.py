@@ -36,6 +36,28 @@ def load_asinh_stats(path, channels=None):
     return {**stats, "vmin": vmin, "vmax": vmax}
 
 
+def normalization_kwargs_from_stats(
+    path,
+    channels,
+    low_pct=DEFAULT_LOW_PERCENTILE,
+    high_pct=DEFAULT_HIGH_PERCENTILE,
+    softening=DEFAULT_ASINH_SOFTENING,
+):
+    """Build validated ``asinh_normalize`` arguments from a statistics file."""
+    if not 0.0 <= low_pct < high_pct <= 100.0:
+        raise ValueError("Percentiles must satisfy 0 <= low_pct < high_pct <= 100.")
+    if softening <= 0:
+        raise ValueError("softening must be greater than zero.")
+    stats = load_asinh_stats(path, channels=channels)
+    return {
+        "low_pct": low_pct,
+        "high_pct": high_pct,
+        "softening": softening,
+        "vmin": stats["vmin"],
+        "vmax": stats["vmax"],
+    }
+
+
 def _channel_limits(values, channels, name):
     limits = torch.as_tensor(values, dtype=torch.float32)
     if limits.ndim == 0:
@@ -92,7 +114,11 @@ def asinh_normalize(
     else:
         low = _channel_limits(vmin, channels, "vmin").to(device=x.device, dtype=x.dtype)
         high = _channel_limits(vmax, channels, "vmax").to(device=x.device, dtype=x.dtype)
-        shape = (1, channels, 1, 1) if x.ndim == 4 else ((channels, 1, 1) if x.ndim == 3 else (1, 1))
+        shape = (
+            (1, channels, 1, 1)
+            if x.ndim == 4
+            else ((channels, 1, 1) if x.ndim == 3 else (1, 1))
+        )
         low = low.reshape(shape)
         high = high.reshape(shape)
 
@@ -128,4 +154,3 @@ def load_tensor(filename, tensors_path, device="cpu", as_numpy=False):
 def load_tensor_to_gpu(filename, tensors_path, device, as_numpy=False):
     tensor = load_tensor(filename, tensors_path, as_numpy=False)
     return tensor.to(device)
-

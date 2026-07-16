@@ -26,7 +26,9 @@ from utils import (
     DEFAULT_LOW_PERCENTILE,
     build_optimizer,
     discover_devices,
+    load_model_state,
     specify_dropout_rate,
+    validate_transfer_learning_options,
 )
 
 # Global Sweep Configuration. This also effects early stopping
@@ -161,7 +163,8 @@ to use multiple GPUs when they are available""",
     default=None,
     help=(
         "Euclid-style JSON with fixed per-channel vmin/vmax. A missing file "
-        "is computed from the training split and saved."
+        "is computed from the training split and saved. Transfer learning "
+        "requires this option."
     ),
 )
 @click.option("--normalization-sample-per-image", type=int, default=1000, show_default=True)
@@ -212,6 +215,16 @@ to the cutout_size parameter""",
 def sweep_init(**kwargs):
     # Copy and log args
     args = {k: v for k, v in kwargs.items()}
+
+    try:
+        validate_transfer_learning_options(
+            is_training=args["train"],
+            model_state=args["model_state"],
+            normalize=args["normalize"],
+            normalization_stats=args["normalization_stats"],
+        )
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
 
     if not 0.0 <= args["normalize_low_pct"] < args["normalize_high_pct"] <= 100.0:
         raise click.BadParameter(
@@ -389,10 +402,7 @@ def train(model_cls, datasets, criterion, args):
 
         if args["model_state"]:
             logging.info(f'Loading model from {args["model_state"]}...')
-            if args["device"] == "cpu":
-                model.load_state_dict(torch.load(args["model_state"], map_location="cpu"))
-            else:
-                model.load_state_dict(torch.load(args["model_state"]))
+            load_model_state(model, args["model_state"], device=args["device"])
 
         optimizer = build_optimizer(
             model,
