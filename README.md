@@ -15,8 +15,9 @@ DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch CNN pipeline for
 | Path | Purpose |
 | --- | --- |
 | cnn/ | DRAGON CNN definition, ResNet50 variant, and a larger-cutout model. |
-| data_preprocessing/ | FITS dataset class, HDF5 tensor creation, and split generation. |
+| data_preprocessing/ | Training metadata, FITS tensor creation, and split generation. |
 | train/ | Training entrypoints and W&B sweep runner. |
+| scripts/ | Checkpoint conversion and local training-report utilities. |
 | modules/ | Inference, heatmap generation, ensemble voting, and notebooks. |
 | models/ | Example trained weights and voter model sets. |
 | utils/ | Data, device, and tensor helpers. |
@@ -43,6 +44,12 @@ The data loader supports two formats:
 
 1) HDF5 tensors (recommended, fast)
 2) Legacy per-image .pt tensors (auto-generated)
+
+Survey integrations build `raw_info.csv` and `labels.csv` with
+`data_preprocessing.prepare_training.prepare_training_catalog`. They supply
+their own catalog and cutout paths through `ClassSpec`; band names are used as
+provided. Individual classes may be empty, but the combined dataset must retain
+at least one row.
 
 ### HDF5 pipeline (recommended)
 
@@ -170,6 +177,21 @@ recomputes statistics from inference data.
 
 Transfer learning:
 
+When the target dataset has a different number of image channels or classes,
+adapt the pretrained checkpoint first:
+
+```bash
+python -m scripts.convert_model_channels \
+	--in-model models/glowing-capybara-20.pt \
+	--out-model /path/to/run/model_adapted.pt \
+	--target-channels 4 \
+	--target-classes 9
+```
+
+`--target-channels` is required so dataset-specific channel counts remain in
+the calling pipeline. `--target-classes` is optional; when supplied, matching
+classifier weights are reinitialized for that output size.
+
 ```bash
 python train/train.py \
 	--transfer_learn \
@@ -201,6 +223,29 @@ python train/wandb_sweep_train.py \
 ```
 
 The sweep entrypoint supports both dragon and resnet model types.
+
+## Training result reports
+
+Use `scripts/report_training_results.py` to summarize locally stored W&B confusion
+matrices, aggregate metrics, and per-class metrics. It reports the best devel
+step by accuracy by default; use `--selection latest` to report the latest
+table for each split instead. Parent-directory scans support both
+`wandb/run-*` and `wandb/offline-run-*` layouts.
+
+For the default accuracy selection, the reporter uses the trainer's recorded
+`best_epoch` when available. Every split in a best-step report comes from that
+same step; a missing split is reported as unavailable rather than substituted
+from another epoch. Loss is shown only when W&B summary metadata identifies it
+as belonging to the selected step. The trainer's `best_metrics.json` is used as
+a fallback when it maps uniquely to a run; use `--best-metrics PATH` to supply
+it explicitly for a single run. When a local `run-*.wandb` transaction log is
+present, its history is the authoritative source for table-to-step mappings;
+run the reporter from the project virtual environment so the W&B log reader is
+available.
+
+```bash
+python -m scripts.report_training_results /path/to/dragon_runs
+```
 
 ## Inference
 
