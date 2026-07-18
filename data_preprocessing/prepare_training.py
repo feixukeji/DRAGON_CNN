@@ -55,12 +55,17 @@ class EmptyTrainingCatalogError(ValueError):
 
 def _load_objects(csv_path: Path) -> pd.DataFrame:
     frame = pd.read_csv(csv_path, dtype={"object_id": str})
-    missing = [
-        column for column in ("object_id", "ra", "dec") if column not in frame
-    ]
-    if missing:
+    if "object_id" not in frame:
         raise ValueError(
-            f"Missing required column(s) in {csv_path}: {', '.join(missing)}"
+            f"Missing required column(s) in {csv_path}: object_id"
+        )
+
+    coordinate_columns = {"ra", "dec"}.intersection(frame.columns)
+    if len(coordinate_columns) == 1:
+        missing_coordinate = ({"ra", "dec"} - coordinate_columns).pop()
+        raise ValueError(
+            f"Coordinate columns must be provided together in {csv_path}; "
+            f"missing {missing_coordinate}"
         )
     return frame
 
@@ -72,8 +77,11 @@ def _build_rows(
     bands: Sequence[str],
 ) -> pd.DataFrame:
     original_object_ids = objects["object_id"].astype(str)
+    metadata_columns = ["object_id"]
+    if {"ra", "dec"}.issubset(objects.columns):
+        metadata_columns.extend(["ra", "dec"])
     rows = add_class_prefix_to_object_ids(
-        objects.loc[:, ["object_id", "ra", "dec"]],
+        objects.loc[:, metadata_columns],
         class_name,
     )
     rows["class"] = class_name
@@ -125,7 +133,10 @@ def prepare_training_catalog(
     """Write ``raw_info.csv`` and ``labels.csv`` for DRAGON training.
 
     Band names are used exactly as supplied. Catalog and cutout paths remain
-    survey-owned configuration supplied through ``class_specs``.
+    survey-owned configuration supplied through ``class_specs``. Every catalog
+    must contain ``object_id``. Catalogs that also contain both ``ra`` and
+    ``dec`` participate in coordinate-based duplicate filtering; catalogs with
+    neither coordinate column skip that filtering.
     """
     specs = list(class_specs)
     ordered_classes = list(class_order)
@@ -136,13 +147,26 @@ def prepare_training_catalog(
         spec.name: _load_objects(spec.csv_path)
         for spec in specs
     }
-    objects_by_class, discarded_counts = (
-        discard_coordinate_equivalent_duplicates(
-            objects_by_class,
-            tolerance_arcsec=coordinate_tolerance_arcsec,
-            context=f"{context} catalogs",
+    objects_with_coordinates = {
+        class_name: objects
+        for class_name, objects in objects_by_class.items()
+        if {"ra", "dec"}.issubset(objects.columns)
+    }
+    if objects_with_coordinates:
+        filtered_objects, coordinate_discarded_counts = (
+            discard_coordinate_equivalent_duplicates(
+                objects_with_coordinates,
+                tolerance_arcsec=coordinate_tolerance_arcsec,
+                context=f"{context} catalogs",
+            )
         )
-    )
+        objects_by_class.update(filtered_objects)
+    else:
+        coordinate_discarded_counts = {}
+    discarded_counts = {
+        spec.name: coordinate_discarded_counts.get(spec.name, 0)
+        for spec in specs
+    }
 
     rows_by_class = {
         spec.name: _build_rows(
