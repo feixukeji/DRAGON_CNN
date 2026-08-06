@@ -30,11 +30,7 @@ class GradualBackboneUnfreezer:
         module.eval()
 
     def __init__(self, model):
-        parallel_types = (
-            torch.nn.DataParallel,
-            torch.nn.parallel.DistributedDataParallel,
-        )
-        self.model = model.module if isinstance(model, parallel_types) else model
+        self.model = model
         backbone_root = self.model
         blocks = [
             (name, module)

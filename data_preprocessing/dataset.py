@@ -7,8 +7,6 @@ import h5py
 import torch
 from torch.utils.data import Dataset
 import torch.multiprocessing as mp
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
 
 from utils import load_data_dir
 
@@ -16,11 +14,6 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 mp.set_sharing_strategy("file_system")
-
-def is_main_process():
-    if not dist.is_available() or not dist.is_initialized():
-        return True
-    return dist.get_rank() == 0
 
 
 class FITSDataset(Dataset):
@@ -32,12 +25,8 @@ class FITSDataset(Dataset):
             label_col="class",
             slug=None,
             split=None,
-            cutout_size=94,
-            normalize=False,
             transforms=None,
-            channels=3,
             load_labels=True,
-            num_classes=None,
             expand_factor=1
     ):
         # Set data directories
@@ -45,9 +34,6 @@ class FITSDataset(Dataset):
         self.tensors_path = self.data_dir / "tensors"
 
         # Initialize image metadata
-        self.channels = channels
-        self.cutout_shape = (channels, cutout_size, cutout_size)
-        self.normalize = normalize
         self.transform = transforms
         self.expand_factor = expand_factor
 
@@ -69,10 +55,8 @@ class FITSDataset(Dataset):
             else:
                 self.labels = np.asarray(self.data_info[label_col])
 
-            self.num_classes = len(np.unique(self.labels)) if num_classes is None else num_classes
         else:
             self.labels = np.ones(len(self.data_info), dtype=int)
-            self.num_classes = 1
 
         # HDF5 initialization variables.
         self.use_h5 = True
@@ -99,10 +83,6 @@ class FITSDataset(Dataset):
             len(self.data_info),
             self.h5_path,
         )
-
-        self.sampler = None
-        if dist.is_available() and dist.is_initialized():
-            self.sampler = DistributedSampler(self, num_replicas=dist.get_world_size(), rank=dist.get_rank())
 
     def _lazy_init_h5(self):
         """Initializes the HDF5 file lazily when a PyTorch background worker asks for it."""
@@ -151,9 +131,6 @@ class FITSDataset(Dataset):
                 self.h5_file.close()
             except Exception:
                 pass
-
-    def get_sampler(self):
-        return self.sampler
 
     @staticmethod
     def load_fits_as_tensor(filename, device="cpu"):

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,9 +13,6 @@ from data_preprocessing import create_cutout_tensors
 from utils import label_mapping_frame, load_asinh_stats, load_label_mapping
 
 
-SIGNATURE_NAME = "preprocessing.sha256"
-
-
 @dataclass(frozen=True)
 class PreparedInferenceData:
     run_dir: Path
@@ -27,7 +22,6 @@ class PreparedInferenceData:
     normalization_stats_path: Path
     h5_path: Path
     rows: int
-    rebuilt_tensors: bool
 
 
 def _resolve_file(path: Path | str, description: str) -> Path:
@@ -62,21 +56,6 @@ def _copy_file(source: Path, destination: Path) -> None:
     shutil.copy2(source, destination)
 
 
-def _preprocessing_signature(
-    raw_info_path: Path,
-    bands: tuple[str, ...],
-    cutout_size: int,
-) -> str:
-    digest = hashlib.sha256()
-    digest.update(raw_info_path.read_bytes())
-    config = json.dumps(
-        {"bands": bands, "cutout_size": cutout_size},
-        sort_keys=True,
-    ).encode("utf-8")
-    digest.update(config)
-    return digest.hexdigest()
-
-
 def prepare_inference_data(
     *,
     catalog_path: Path | str,
@@ -89,10 +68,9 @@ def prepare_inference_data(
     workers: int,
     labels_path: Path | str | None = None,
     normalization_stats_path: Path | str | None = None,
-    force_preprocess: bool = False,
     copy_artifacts: bool = True,
 ) -> PreparedInferenceData:
-    """Build inference metadata and reuse valid tensors."""
+    """Build inference metadata and recreate tensors for every run."""
     catalog = _resolve_file(catalog_path, "Catalog")
     cutouts = Path(cutout_dir).expanduser().resolve()
     output = Path(run_dir).expanduser().resolve()
@@ -148,46 +126,22 @@ def prepare_inference_data(
         destination_labels = source_labels
         destination_stats = source_stats
 
-    signature = _preprocessing_signature(
-        raw_info_path,
-        normalized_bands,
-        cutout_size,
-    )
-    current_signature_path = output / SIGNATURE_NAME
-    current_signature_path.write_text(signature + "\n", encoding="ascii")
-
     tensors_dir = output / "tensors"
     h5_path = tensors_dir / "tensors.h5"
     clean_info_path = tensors_dir / "clean_info.csv"
-    cached_signature_path = tensors_dir / SIGNATURE_NAME
-    cached_signature = (
-        cached_signature_path.read_text(encoding="ascii").strip()
-        if cached_signature_path.is_file()
-        else None
+    create_cutout_tensors(
+        data_dir=output,
+        csv_path=raw_info_path,
+        out_dir=tensors_dir,
+        bands=normalized_bands,
+        cutout_size=cutout_size,
+        workers=workers,
+        use_gpu=False,
     )
-    rebuild = (
-        force_preprocess
-        or not h5_path.is_file()
-        or not clean_info_path.is_file()
-        or cached_signature != signature
-    )
-
-    if rebuild:
-        create_cutout_tensors(
-            data_dir=output,
-            csv_path=raw_info_path,
-            out_dir=tensors_dir,
-            bands=normalized_bands,
-            cutout_size=cutout_size,
-            workers=workers,
-            use_gpu=False,
-        )
 
     clean_info = pd.read_csv(clean_info_path, dtype={"object_id": str})
     if clean_info.empty:
         raise ValueError("No readable FITS cutouts remain after preprocessing")
-    if rebuild:
-        cached_signature_path.write_text(signature + "\n", encoding="ascii")
     info_path = output / "info.csv"
     clean_info.to_csv(info_path, index=False)
 
@@ -199,7 +153,6 @@ def prepare_inference_data(
         normalization_stats_path=destination_stats,
         h5_path=h5_path,
         rows=len(clean_info),
-        rebuilt_tensors=rebuild,
     )
 
 
@@ -223,7 +176,6 @@ def prepare_inference_data(
     "normalization_stats_path",
     type=click.Path(exists=True, dir_okay=False),
 )
-@click.option("--force-preprocess", is_flag=True)
 @click.option("--copy-artifacts/--no-copy-artifacts", default=True)
 def main(**kwargs) -> None:
     """Prepare metadata and tensors for DRAGON inference."""
@@ -232,9 +184,8 @@ def main(**kwargs) -> None:
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
-    action = "rebuilt" if prepared.rebuilt_tensors else "reused"
     click.echo(f"Prepared {prepared.rows} inference rows in {prepared.run_dir}")
-    click.echo(f"Tensor cache: {action} ({prepared.h5_path})")
+    click.echo(f"Rebuilt inference tensors: {prepared.h5_path}")
     click.echo(f"Normalization stats: {prepared.normalization_stats_path}")
 
 

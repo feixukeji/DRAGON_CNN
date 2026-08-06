@@ -15,21 +15,14 @@ def get_data_loader(
     batch_size,
     n_workers,
     shuffle=True,
-    sampler=None,
     generator=None,
     worker_init_fn=None,
 ):
-    # IMPORTANT: If a sampler is provided, shuffle MUST be False.
-    # The DistributedSampler handles the shuffling internally.
-    if sampler is not None:
-        shuffle = False
-
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": batch_size,
         "shuffle": shuffle,
         "num_workers": n_workers,
-        "sampler": sampler,
         "pin_memory": torch.cuda.is_available(),
         "generator": generator,
         "worker_init_fn": worker_init_fn,

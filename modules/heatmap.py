@@ -429,10 +429,7 @@ def main(
     dataset = FITSDataset(
         data_dir,
         slug=slug,
-        normalize=normalize,
         split=split,
-        cutout_size=cutout_size,
-        channels=channels,
         label_col=label_col_arr,
         transforms=T,
         load_labels=False

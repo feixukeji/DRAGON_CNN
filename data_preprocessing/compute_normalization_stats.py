@@ -14,7 +14,6 @@ from utils import DEFAULT_HIGH_PERCENTILE, DEFAULT_LOW_PERCENTILE
 @click.option("--split-slug", type=str, required=True)
 @click.option("--split", type=str, default="train", show_default=True)
 @click.option("--channels", type=int, default=1, show_default=True)
-@click.option("--cutout-size", type=int, default=94, show_default=True)
 @click.option("--low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True)
 @click.option("--high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True)
 @click.option("--sample-per-image", type=int, default=1000, show_default=True)
@@ -31,7 +30,6 @@ def main(
     split_slug,
     split,
     channels,
-    cutout_size,
     low_pct,
     high_pct,
     sample_per_image,
@@ -55,8 +53,6 @@ def main(
         data_dir=data_dir,
         slug=split_slug,
         split=split,
-        channels=channels,
-        cutout_size=cutout_size,
         load_labels=False,
     )
     stats = compute_asinh_stats(

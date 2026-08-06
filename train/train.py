@@ -18,8 +18,8 @@ from data_preprocessing import (
     get_data_loader,
     load_or_compute_asinh_stats,
 )
-from cnn import model_factory, model_stats, save_trained_model
-from create_trainer import create_trainer, create_transfer_learner
+from cnn import DRAGON, model_stats, save_trained_model
+from .create_trainer import create_trainer, create_transfer_learner
 from utils import (
     DEFAULT_ASINH_SOFTENING,
     DEFAULT_HIGH_PERCENTILE,
@@ -79,12 +79,6 @@ class ClassWeightedCrossEntropyLoss(nn.Module):
         return self.weight.to(device=input.device, dtype=input.dtype)
 
 
-class ClassWeightedNLLLoss(ClassWeightedCrossEntropyLoss):
-    def forward(self, input, target):
-        weight = self._weight_for(input)
-        return F.nll_loss(input, target, weight=weight)
-
-
 class RandomDihedralAugmentation(nn.Module):
     """Apply one of four right-angle rotations and an optional horizontal flip."""
 
@@ -120,25 +114,7 @@ class RandomDihedralAugmentation(nn.Module):
     "--run_id",
     type=str,
     default=None,
-    help="""The run id. Practically this only needs to be used
-if you are resuming a previosuly run experiment""",
-)
-@click.option(
-    "--run_name",
-    type=str,
-    default=None,
-    help="""A run is supposed to be a sub-class of an experiment.
-So this variable should be specified accordingly""",
-)
-@click.option(
-    "--model_type",
-    type=click.Choice(
-        [
-            "dragon"
-        ],
-        case_sensitive=False,
-    ),
-    default="dragon",
+    help="The W&B run ID to resume, if any.",
 )
 @click.option("--model_state", type=click.Path(exists=True), default=None)
 @click.option("--data_dir", type=click.Path(exists=True), required=True)
@@ -152,10 +128,10 @@ So this variable should be specified accordingly""",
     "--split_slug",
     type=str,
     required=True,
-    help="""This specifies how the data_preprocessing is split into train/
-devel/test sets. Balanced/Unbalanced refer to whether selecting
-equal number of images from each class. xs, sm, lg, dev all refer
-to what fraction is picked for train/devel/test.""",
+    help=(
+        "Shared basename for splits/<slug>-train.csv, "
+        "splits/<slug>-devel.csv, and splits/<slug>-test.csv."
+    ),
 )
 @click.option("--cutout_size", type=int, default=94)
 @click.option("--channels", type=int, default=1)
@@ -164,8 +140,7 @@ to what fraction is picked for train/devel/test.""",
     "--n_workers",
     type=int,
     default=4,
-    help="""The number of workers to be used during the
-data_preprocessing loading process.""",
+    help="Number of DataLoader worker processes.",
 )
 @click.option(
     "--seed",
@@ -173,18 +148,6 @@ data_preprocessing loading process.""",
     default=42,
     show_default=True,
     help="Seed model initialization, data shuffling, augmentation, and dropout.",
-)
-@click.option(
-    "--loss",
-    type=click.Choice(
-        [
-            "nll",
-            "ce",
-        ],
-        case_sensitive=False,
-    ),
-    default="ce",
-    help="""The loss function to use""",
 )
 @click.option("--batch_size", type=int, default=16)
 @click.option("--epochs", type=int, default=40)
@@ -215,12 +178,6 @@ data_preprocessing loading process.""",
 @click.option("--adamw-beta1", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.9, show_default=True)
 @click.option("--adamw-beta2", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.999, show_default=True)
 @click.option("--adamw-eps", type=click.FloatRange(min=0.0, min_open=True), default=1e-8, show_default=True)
-@click.option(
-    "--parallel/--no-parallel",
-    default=True,
-    help="""The parallel argument controls whether or not
-to use multiple GPUs when they are available""",
-)
 @click.option(
     "--normalize/--no-normalize",
     default=True,
@@ -306,7 +263,7 @@ data is augmented""",
     help="Use class weights in the loss. 'balanced' uses n_samples / (n_classes * class_count) from the train split.",
 )
 def train(**kwargs):
-    """Runs the training procedure using MLFlow."""
+    """Train a DRAGON model and log the run to W&B."""
 
     # Copy and log args
     args = {k: v for k, v in kwargs.items()}
@@ -357,30 +314,14 @@ def train(**kwargs):
     run_dir.mkdir(parents=True, exist_ok=True)
     args["run_dir"] = str(run_dir)
 
-    # Create the model given model_type
-    cls = model_factory(args["model_type"])
     model_args = {
         "cutout_size": args["cutout_size"],
         "channels": args["channels"],
         "num_classes": args["n_classes"]
     }
+    model = DRAGON(**model_args).to(args["device"])
 
-    if "drp" in args["model_type"].split("_"):
-        logging.info(
-            "Using dropout rate of {} in the model".format(
-                args["dropout_rate"]
-            )
-        )
-        model_args["dropout"] = "True"
-
-    model = cls(**model_args)
-    if args["parallel"] and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        args["device"] = "cuda"
-
-    model = model.to(args["device"])
-
-    # Chnaging the default dropout rate if specified
+    # Change the default dropout rate if specified.
     if args["dropout_rate"] is not None:
         specify_dropout_rate(model, args["dropout_rate"])
 
@@ -426,12 +367,7 @@ def train(**kwargs):
         k: FITSDataset(
             data_dir=args["data_dir"],
             slug=args["split_slug"],
-            cutout_size=args["cutout_size"],
-            channels=args["channels"],
-            normalize=args["normalize"],
-            transforms=None,
             split=k,
-            num_classes=args["n_classes"],
             expand_factor=args["expand_data"] if k == "train" else 1,
         )
         for k in splits
@@ -480,12 +416,7 @@ def train(**kwargs):
         args["class_weights"] = class_weights.detach().cpu().tolist()
         logging.info(f"Using balanced class weights: {args['class_weights']}")
 
-    # Define the criterion
-    loss_dict = {
-        "nll": ClassWeightedNLLLoss(weight=class_weights),
-        "ce": ClassWeightedCrossEntropyLoss(weight=class_weights),
-    }
-    criterion = loss_dict[args["loss"]]
+    criterion = ClassWeightedCrossEntropyLoss(weight=class_weights)
 
     # Log into W&B
     wandb.login()

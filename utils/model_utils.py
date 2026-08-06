@@ -20,12 +20,7 @@ def unwrap_state_dict(state):
 def load_model_state(model, model_path, device="cpu"):
     """Load a checkpoint into ``model`` on the requested device."""
     state = torch.load(model_path, map_location=device)
-    parallel_types = (
-        torch.nn.DataParallel,
-        torch.nn.parallel.DistributedDataParallel,
-    )
-    target_model = model.module if isinstance(model, parallel_types) else model
-    target_model.load_state_dict(unwrap_state_dict(state))
+    model.load_state_dict(unwrap_state_dict(state))
     return model
 
 

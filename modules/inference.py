@@ -266,8 +266,6 @@ def main(
         data_dir,
         slug=None,
         split=None,
-        cutout_size=cutout_size,
-        channels=channels,
         transforms=transform,
         load_labels=False,
     )

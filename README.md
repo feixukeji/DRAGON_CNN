@@ -1,6 +1,6 @@
 # DRAGON_CNN
 
-DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch CNN pipeline for multi-class classification of astronomical cutouts. This repository contains data preprocessing for FITS images, model training and sweeps, inference with optional Monte Carlo dropout, Grad-CAM heatmaps, and an ensemble voting utility.
+DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch CNN pipeline for multi-class classification of astronomical cutouts. This repository contains data preprocessing for FITS images, model training, inference with optional Monte Carlo dropout, Grad-CAM heatmaps, and an ensemble voting utility.
 
 ## What is in this repository
 
@@ -16,7 +16,7 @@ DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch CNN pipeline for
 | --- | --- |
 | cnn/ | DRAGON CNN definition, ResNet50 variant, and a larger-cutout model. |
 | data_preprocessing/ | Training metadata, FITS tensor creation, and split generation. |
-| train/ | Training entrypoints and W&B sweep runner. |
+| train/ | Single-device training entrypoint and PyTorch Ignite trainer. |
 | scripts/ | Checkpoint conversion and local training-report utilities. |
 | modules/ | Inference, heatmap generation, ensemble voting, and notebooks. |
 | models/ | Example trained weights and voter model sets. |
@@ -36,7 +36,7 @@ pip install -e .
 
 Notes:
 - A GPU is strongly recommended for training and heatmap generation.
-- Training and sweeps require a valid W&B login (see W&B docs).
+- Training requires a valid W&B login (see W&B docs).
 
 ## Data preparation
 
@@ -76,7 +76,8 @@ This creates:
 cp /path/to/data_dir/tensors/clean_info.csv /path/to/data_dir/info.csv
 ```
 
-4. Create balanced train/devel/test splits (adds h5_index for HDF5):
+4. Create stratified train/devel/test splits that retain the original class
+   frequencies (and add `h5_index` for HDF5):
 
 ```bash
 python data_preprocessing/make_splits.py \
@@ -92,22 +93,26 @@ data_dir/
 	info.csv
 	labels.csv                 # optional mapping of label keys to numeric values
 	splits/
-		balanced-dev-train.csv
-		balanced-dev-devel.csv
-		balanced-dev-test.csv
+		unbalanced-dev-train.csv
+		unbalanced-dev-devel.csv
+		unbalanced-dev-test.csv
 	tensors/
 		tensors.h5
 ```
 
 ## Training
 
-The main training entrypoint is train/train.py and logs to W&B.
+The main training entrypoint is `python -m train.train` and logs to W&B. It selects a
+single CUDA device when available and otherwise uses the CPU; multi-process and
+multi-device training are not supported. The example below is a generic
+six-class, 94-pixel configuration; set the dimensions and class count for your
+dataset.
 
 ```bash
-python train/train.py \
+python -m train.train \
 	--experiment_name dragon \
 	--data_dir /path/to/data_dir \
-	--split_slug balanced-dev \
+	--split_slug unbalanced-dev \
 	--cutout_size 94 \
 	--channels 3 \
 	--n_classes 6 \
@@ -117,23 +122,27 @@ python train/train.py \
 ```
 
 Key behavior:
-- Saves checkpoints to checkpoints/ and final weights to models/.
+- Saves checkpoints to `RUN_DIR/checkpoints/` and final weights to
+  `RUN_DIR/models/`; `RUN_DIR` defaults to `DATA_DIR`.
 - Uses `--seed 42` by default for reproducible model initialization, data
   shuffling, training augmentation, dropout, and DataLoader workers.
-- With `--normalize` (the default), applies the Euclid YOLO stretch independently
-  to each cutout/channel: clip at the 0.5/99.5 percentiles, map to `[0, 1]`, then
-  apply `asinh(x / 0.1) / asinh(1 / 0.1)`.
-- Uses Kornia GPU augmentations when --crop is enabled.
+- With `--normalize` (the default), clips at the 0.5/99.5 percentiles, maps to
+  `[0, 1]`, then applies `asinh(x / 0.1) / asinh(1 / 0.1)`. Without
+  `--normalization-stats`, percentiles are computed independently per
+  cutout/channel; with a statistics file, every cutout uses its fixed
+  training-set per-channel limits.
+- Applies `--crop` center-cropping and train-only `--augment` dihedral transforms
+  on the selected device.
 - Training expects a label column named class in info.csv by default.
 
 The optimizer can be selected without changing code:
 
 ```bash
 # Momentum SGD (the default)
-python train/train.py ... --optimizer sgd --lr0 1e-3 --momentum 0.9 --nesterov
+python -m train.train ... --optimizer sgd --lr0 1e-3 --momentum 0.9 --nesterov
 
 # AdamW; momentum/nesterov are ignored
-python train/train.py ... --optimizer adamw --lr0 3e-5 --weight_decay 1e-4
+python -m train.train ... --optimizer adamw --lr0 3e-5 --weight_decay 1e-4
 ```
 
 AdamW uses `--adamw-beta1`, `--adamw-beta2`, and `--adamw-eps`; bias and
@@ -146,9 +155,9 @@ the file if it exists; otherwise it automatically computes per-channel limits
 from the training split only and saves the file:
 
 ```bash
-python train/train.py \
+python -m train.train \
 	--data_dir /path/to/data_dir \
-	--split_slug balanced-dev \
+	--split_slug unbalanced-dev \
 	--channels 3 \
 	--normalization-stats /path/to/data_dir/normalization_stats.json
 ```
@@ -158,7 +167,7 @@ Statistics can also be generated explicitly before training:
 ```bash
 python -m data_preprocessing.compute_normalization_stats \
 	--data-dir /path/to/data_dir \
-	--split-slug balanced-dev \
+	--split-slug unbalanced-dev \
 	--split train \
 	--channels 3 \
 	--output /path/to/data_dir/normalization_stats.json
@@ -188,14 +197,14 @@ the calling pipeline. `--target-classes` is optional; when supplied, matching
 classifier weights are reinitialized for that output size.
 
 ```bash
-python train/train.py \
+python -m train.train \
 	--transfer_learn \
 	--unfreeze-warmup-epochs 3 \
 	--unfreeze-blocks-per-epoch 1 \
 	--lr0 2e-5 \
 	--model_state /path/to/model.pt \
 	--data_dir /path/to/data_dir \
-	--split_slug balanced-dev \
+	--split_slug unbalanced-dev \
 	--normalize \
 	--normalization-stats /path/to/run/normalization_stats.json
 ```
@@ -207,17 +216,6 @@ unfrozen after epoch 3 and all eight backbone blocks are trainable from epoch
 11 onward. Transfer learning requires fixed asinh normalization. If the JSON
 does not yet exist, it is computed from the transfer-learning training split
 and saved; `--no-normalize` and an omitted `--normalization-stats` are rejected.
-
-W&B hyperparameter sweeps:
-
-```bash
-python train/wandb_sweep_train.py \
-	--experiment_name dragon \
-	--data_dir /path/to/data_dir \
-	--split_slug balanced-dev
-```
-
-The sweep entrypoint supports both dragon and resnet model types.
 
 ## Training result reports
 
@@ -252,7 +250,7 @@ per-cutout statistics or unnormalized images.
 
 ```bash
 python modules/inference.py \
-	--model-path models/dragon-balanced-dev-XXXXX.pt \
+	--model-path /path/to/run/models/dragon-unbalanced-dev-XXXXX.pt \
 	--output-dir /path/to/output \
 	--data-dir /path/to/data_dir \
 	--normalization-stats /path/to/run/normalization_stats.json \
@@ -272,9 +270,10 @@ filename prefix remain accepted.
 
 ```bash
 python modules/heatmap.py \
-	--model_path models/dragon-balanced-dev-XXXXX.pt \
+	--model_path /path/to/run/models/dragon-unbalanced-dev-XXXXX.pt \
 	--output_path /path/to/heatmaps/ \
 	--data_dir /path/to/data_dir \
+	--normalization-stats /path/to/run/normalization_stats.json \
 	--cutout_size 94 \
 	--channels 3 \
 	--n_classes 6

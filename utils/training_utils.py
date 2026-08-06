@@ -1,4 +1,4 @@
-"""Validation shared by standard and sweep training entry points."""
+"""Validation for the training entry point."""
 
 
 def validate_transfer_learning_options(
