@@ -128,6 +128,7 @@ def prepare_training_catalog(
     output_dir: Path | str,
     class_order: Sequence[str] = DRAGON_CLASS_ORDER,
     coordinate_tolerance_arcsec: float = DEFAULT_COORDINATE_TOLERANCE_ARCSEC,
+    filter_coordinate_equivalent_duplicates: bool = True,
     context: str = "DRAGON training",
 ) -> PreparedTrainingCatalog:
     """Write ``raw_info.csv`` and ``labels.csv`` for DRAGON training.
@@ -135,7 +136,8 @@ def prepare_training_catalog(
     Band names are used exactly as supplied. Catalog and cutout paths remain
     survey-owned configuration supplied through ``class_specs``. Every catalog
     must contain ``object_id``. Catalogs that also contain both ``ra`` and
-    ``dec`` participate in coordinate-based duplicate filtering; catalogs with
+    ``dec`` participate in coordinate-based duplicate filtering when
+    ``filter_coordinate_equivalent_duplicates`` is enabled; catalogs with
     neither coordinate column skip that filtering.
     """
     specs = list(class_specs)
@@ -147,22 +149,22 @@ def prepare_training_catalog(
         spec.name: _load_objects(spec.csv_path)
         for spec in specs
     }
-    objects_with_coordinates = {
-        class_name: objects
-        for class_name, objects in objects_by_class.items()
-        if {"ra", "dec"}.issubset(objects.columns)
-    }
-    if objects_with_coordinates:
-        filtered_objects, coordinate_discarded_counts = (
-            discard_coordinate_equivalent_duplicates(
-                objects_with_coordinates,
-                tolerance_arcsec=coordinate_tolerance_arcsec,
-                context=f"{context} catalogs",
+    coordinate_discarded_counts: dict[str, int] = {}
+    if filter_coordinate_equivalent_duplicates:
+        objects_with_coordinates = {
+            class_name: objects
+            for class_name, objects in objects_by_class.items()
+            if {"ra", "dec"}.issubset(objects.columns)
+        }
+        if objects_with_coordinates:
+            filtered_objects, coordinate_discarded_counts = (
+                discard_coordinate_equivalent_duplicates(
+                    objects_with_coordinates,
+                    tolerance_arcsec=coordinate_tolerance_arcsec,
+                    context=f"{context} catalogs",
+                )
             )
-        )
-        objects_by_class.update(filtered_objects)
-    else:
-        coordinate_discarded_counts = {}
+            objects_by_class.update(filtered_objects)
     discarded_counts = {
         spec.name: coordinate_discarded_counts.get(spec.name, 0)
         for spec in specs

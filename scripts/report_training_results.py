@@ -685,6 +685,19 @@ def _load_best_metrics(path: Path) -> dict[str, float]:
             )
         result[key] = float(value)
 
+    optional_macro_f1 = data.get("best_devel_macro_f1")
+    if optional_macro_f1 is not None:
+        if (
+            isinstance(optional_macro_f1, bool)
+            or not isinstance(optional_macro_f1, (int, float))
+            or not math.isfinite(float(optional_macro_f1))
+        ):
+            raise ReportDataError(
+                "best_metrics.json contains an invalid "
+                f"'best_devel_macro_f1' value: {path}"
+            )
+        result["best_devel_macro_f1"] = float(optional_macro_f1)
+
     if _summary_step(result, "best_epoch") is None:
         raise ReportDataError(
             f"best_metrics.json contains a non-integer best_epoch: {path}"
@@ -900,9 +913,14 @@ def _report_run(
 
     selected_step: int | None = None
     if args.selection == "best":
+        recorded_metric = (
+            "macro_f1"
+            if summary is not None and "best_devel_macro_f1" in summary
+            else "accuracy"
+        )
         recorded_best_step = (
             _summary_step(summary, "best_epoch")
-            if summary is not None and args.best_metric == "accuracy"
+            if summary is not None and args.best_metric == recorded_metric
             else None
         )
         if recorded_best_step is not None:
@@ -921,18 +939,19 @@ def _report_run(
                 recorded_table.matrix,
                 recorded_table.labels,
             )
-            recorded_score = recorded_metrics.accuracy
-            summary_score = summary.get("best_devel_accuracy") if summary else None
+            recorded_score = _metric_score(args.best_metric, recorded_metrics)
+            summary_score_key = f"best_devel_{args.best_metric}"
+            summary_score = summary.get(summary_score_key) if summary else None
             if summary_score is not None and not math.isclose(
                 recorded_score, summary_score, rel_tol=1e-9, abs_tol=1e-12
             ):
                 raise ReportDataError(
-                    "Recomputed devel accuracy does not match "
-                    f"best_devel_accuracy at step {recorded_best_step}: "
+                    f"Recomputed devel {args.best_metric} does not match "
+                    f"{summary_score_key} at step {recorded_best_step}: "
                     f"{recorded_score:.12g} != {summary_score:.12g}"
                 )
             best = (recorded_best_step, recorded_score)
-            selection_source = "recorded best_epoch"
+            selection_source = f"recorded best_epoch ({recorded_metric})"
         else:
             best = _select_best_step(
                 tables, label_mapping, args.best_metric, cache=cache
@@ -1024,7 +1043,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--best-metric",
         choices=["accuracy", "macro_f1", "weighted_f1"],
-        default="accuracy",
+        default="macro_f1",
         help="Metric used to pick the best devel step.",
     )
     return parser

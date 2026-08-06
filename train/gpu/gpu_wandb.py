@@ -97,8 +97,6 @@ def initialize_and_run_agent(rank, world_size, args):
             normalize=args["normalize"],
             transforms=T,
             split=k,
-            force_reload=args["force_reload"],
-            n_workers=args["n_workers"]
         )
         for k in splits
     }
@@ -186,7 +184,6 @@ to use multiple GPUs when they are available""",
 loaded images will be normalized using the arsinh function""",
 )
 @click.option("--n_classes", type=int, default=6)
-@click.option("--force_reload/--no_force_reload", type=bool, default=False)
 @click.option(
     "--loss",
     type=click.Choice(

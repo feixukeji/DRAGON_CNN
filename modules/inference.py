@@ -184,6 +184,11 @@ def _summary_file(output_dir, output_path, run_num, n_runs):
     type=click.Path(exists=True, dir_okay=False),
     default=None,
 )
+@click.option(
+    "--labels-path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+)
 @click.option("--batch-size", "--batch_size", type=int, default=256)
 @click.option("--n-workers", "--n_workers", type=int, default=4)
 @click.option("--parallel/--no-parallel", default=True)
@@ -210,6 +215,7 @@ def main(
     normalize_high_pct,
     asinh_softening,
     normalization_stats,
+    labels_path,
     batch_size,
     n_workers,
     parallel,
@@ -268,7 +274,11 @@ def main(
     catalog_path = Path(data_dir) / "info.csv"
     catalog = pd.read_csv(catalog_path, dtype={"object_id": str})
     label_names = None
-    labels_path = Path(data_dir) / "labels.csv"
+    labels_path = (
+        Path(labels_path)
+        if labels_path is not None
+        else Path(data_dir) / "labels.csv"
+    )
     if labels and labels_path.is_file():
         try:
             label_names = load_label_mapping(

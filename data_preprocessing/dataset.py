@@ -2,7 +2,6 @@ from astropy.io import fits
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
 import h5py
 
 import torch
@@ -11,11 +10,7 @@ import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 
-from utils import (
-    load_tensor,
-    load_data_dir,
-    discover_devices
-)
+from utils import load_data_dir
 
 import logging
 
@@ -29,7 +24,7 @@ def is_main_process():
 
 
 class FITSDataset(Dataset):
-    """Dataset from FITS files. Can load legacy .pt files or stream from a fast HDF5 container."""
+    """Stream row-aligned image tensors from an HDF5 container."""
 
     def __init__(
             self,
@@ -43,18 +38,11 @@ class FITSDataset(Dataset):
             channels=3,
             load_labels=True,
             num_classes=None,
-            force_reload=False,
-            n_workers=1,
             expand_factor=1
     ):
         # Set data directories
         self.data_dir = Path(data_dir)
-        self.cutouts_path = self.data_dir / "cutouts"
         self.tensors_path = self.data_dir / "tensors"
-        self.tensors_path.mkdir(parents=True, exist_ok=True)
-
-        # Discover devices for tensor generation
-        device = discover_devices()
 
         # Initialize image metadata
         self.channels = channels
@@ -63,9 +51,13 @@ class FITSDataset(Dataset):
         self.transform = transforms
         self.expand_factor = expand_factor
 
-        # Define paths and load dataframe
-        # IMPORTANT: If using HDF5, make sure load_data_dir points to clean_info.csv
+        # Define paths and load dataframe.
         self.data_info = load_data_dir(self.data_dir, slug, split)
+        if "object_id" not in self.data_info.columns:
+            raise KeyError(
+                "Metadata CSV must contain 'object_id' for HDF5 loading; "
+                "legacy 'file_name' datasets are unsupported."
+            )
 
         # Loading labels
         if load_labels:
@@ -82,56 +74,31 @@ class FITSDataset(Dataset):
             self.labels = np.ones(len(self.data_info), dtype=int)
             self.num_classes = 1
 
-        # HDF5 initialization variables
-        self.use_h5 = False
-        self.h5_path = None
+        # HDF5 initialization variables.
+        self.use_h5 = True
+        self.h5_path = self.tensors_path / "tensors.h5"
         self.h5_file = None
         self.h5_images = None
 
-        # --- LEGACY VS NEW FORMAT ROUTING ---
-        if "file_name" in self.data_info.columns:
-            logging.info("Legacy 'file_name' column detected. Routing to legacy logic with individual .pt files.")
-            self.filenames = np.asarray(self.data_info["file_name"])
-            self.tensor_filepaths = []
+        if not self.h5_path.is_file():
+            raise FileNotFoundError(
+                f"HDF5 dataset not found at {self.h5_path}. "
+                "Please run create_cutouts.py first."
+            )
 
-            if force_reload:
-                logging.info("Force reload on, regenerating legacy tensors...")
-
-            for filename in tqdm(self.filenames, desc="Checking/Generating Legacy Tensors"):
-                flattened_filename = filename.replace('/', '_')
-                filepath = self.tensors_path / f"{flattened_filename}.pt"
-                self.tensor_filepaths.append(str(filepath))
-
-                # On-the-fly generation if missing or forced
-                if not filepath.is_file() or force_reload:
-                    if self.cutouts_path.is_dir():
-                        load_path = self.cutouts_path / filename
-                    else:
-                        load_path = self.data_dir / filename
-
-                    t = FITSDataset.load_fits_as_tensor(load_path, device)
-                    torch.save(t, filepath)
-
-        elif "object_id" in self.data_info.columns:
-            logging.info("New 'object_id' column detected. Activating fast HDF5 logic.")
-            self.use_h5 = True
-            self.h5_path = self.tensors_path / "tensors.h5"
-
-            if not self.h5_path.is_file():
-                raise FileNotFoundError(
-                    f"HDF5 dataset not found at {self.h5_path}. Please run generate_tensors.py first.")
-
-            # --- NEW: Map CSV rows to exact HDF5 indices ---
-            if 'h5_index' not in self.data_info.columns:
-                logging.warning("No 'h5_index' column found! Assuming 1:1 mapping. "
-                                "If this is a shuffled/balanced split, your labels WILL be scrambled!")
-                self.h5_indices = np.arange(len(self.data_info))
-            else:
-                self.h5_indices = np.asarray(self.data_info['h5_index'])
+        if "h5_index" not in self.data_info.columns:
+            logging.warning(
+                "No 'h5_index' column found; assuming a 1:1 row mapping."
+            )
+            self.h5_indices = np.arange(len(self.data_info))
         else:
-            raise KeyError("Metadata CSV must contain either a 'file_name' (legacy) or 'object_id' (new) column.")
+            self.h5_indices = np.asarray(self.data_info["h5_index"])
 
-        logging.info("Initialization of FITS Dataset Completed.")
+        logging.info(
+            "Initialized HDF5 dataset: rows=%d path=%s",
+            len(self.data_info),
+            self.h5_path,
+        )
 
         self.sampler = None
         if dist.is_available() and dist.is_initialized():
@@ -164,15 +131,10 @@ class FITSDataset(Dataset):
 
             idx = index % len(self.labels)
 
-            if self.use_h5:
-                self._lazy_init_h5()
-                true_h5_idx = int(self.h5_indices[idx])
-                pt_np = self.h5_images[true_h5_idx]
-                pt = torch.from_numpy(pt_np)
-            else:
-                filepath = self.tensor_filepaths[idx]
-                pt_np = load_tensor(filepath, tensors_path=self.tensors_path, as_numpy=True)
-                pt = torch.from_numpy(pt_np)
+            self._lazy_init_h5()
+            true_h5_idx = int(self.h5_indices[idx])
+            pt_np = self.h5_images[true_h5_idx]
+            pt = torch.from_numpy(pt_np)
 
             label = torch.tensor(int(self.labels[idx]), dtype=torch.long)
             return pt.squeeze(1), label
@@ -184,7 +146,7 @@ class FITSDataset(Dataset):
 
     def __del__(self):
         """Gracefully close the HDF5 file handle upon garbage collection."""
-        if self.use_h5 and self.h5_file is not None:
+        if getattr(self, "h5_file", None) is not None:
             try:
                 self.h5_file.close()
             except Exception:

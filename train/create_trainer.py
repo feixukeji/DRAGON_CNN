@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 import re
 
@@ -92,11 +93,40 @@ def _to_float(value):
     return None
 
 
+def _register_global_grad_norm_clipping(optimizer, max_grad_norm):
+    """Clip the total gradient L2 norm immediately before optimizer updates."""
+    if max_grad_norm is None:
+        return None
+
+    max_grad_norm = float(max_grad_norm)
+    if not math.isfinite(max_grad_norm) or max_grad_norm < 0:
+        raise ValueError("max_grad_norm must be a finite non-negative value.")
+    if max_grad_norm == 0:
+        return None
+
+    def clip_grad_norm_before_step(optimizer, _args, _kwargs):
+        parameters = [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
+        if parameters:
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm=max_grad_norm)
+
+    return optimizer.register_step_pre_hook(clip_grad_norm_before_step)
+
+
 def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=True, gpu_transforms=None,
                    normalize=False, checkpoint_dir=None, run_id=None, num_epochs=32, run_dir=None,
-                   eval_gpu_transforms=None, normalization_kwargs=None):
+                   eval_gpu_transforms=None, normalization_kwargs=None, max_grad_norm=1.0):
     """Set up Ignite trainer with train-only augmentation and deterministic evaluation."""
 
+    amp_mode = None
+    if torch.device(device).type == "cuda":
+        torch.set_autocast_dtype("cuda", torch.bfloat16)
+        amp_mode = "amp"
+        logging.info("Using CUDA BF16 automatic mixed precision.")
 
     # 1. Define the custom batch preparation function
     def custom_prepare_batch(batch, device, non_blocking, transforms):
@@ -126,17 +156,28 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
     def prepare_eval_batch(batch, device, non_blocking):
         return custom_prepare_batch(batch, device, non_blocking, eval_gpu_transforms)
 
-    # Define a score function.
-    # If using Accuracy (higher is better):
+    # Select checkpoints by macro-F1 so every class contributes equally.
     def score_function(engine):
-        return engine.state.metrics['accuracy']
+        return engine.state.metrics["f1"]
 
     # 2. Pass the custom function to the trainer
     trainer = create_supervised_trainer(
         model, optimizer, criterion, device=device,
         prepare_batch=prepare_train_batch,
-        amp_mode="amp"
+        amp_mode=amp_mode,
     )
+
+    gradient_clip_handle = _register_global_grad_norm_clipping(
+        optimizer,
+        max_grad_norm,
+    )
+    if gradient_clip_handle is not None:
+        logging.info(
+            "Clipping the global gradient L2 norm to max_norm=%g before each optimizer step.",
+            max_grad_norm,
+        )
+        # Keep the removable hook handle with the trainer that owns it.
+        trainer.gradient_clip_handle = gradient_clip_handle
 
     pbar = ProgressBar(persist=False)
 
@@ -155,13 +196,13 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
         "recall": Recall(average="weighted"),
         "loss": Loss(criterion),
         "cm": ConfusionMatrix(num_classes=wandb.config["num_classes"], output_transform=lambda x: x),
-        "f1": Fbeta(beta=1)
+        "f1": Fbeta(beta=1, average=True)
     }
 
     evaluator = create_supervised_evaluator(
         model, metrics=metrics, device=device,
         prepare_batch=prepare_eval_batch,
-        amp_mode="amp"
+        amp_mode=amp_mode,
     )
 
     # Define the checkpoint handler
@@ -171,8 +212,8 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
         n_saved=1,
         require_empty=False,
         score_function=score_function,
-        score_name="accuracy",
-        global_step_transform=lambda engine, event: engine.state.epoch
+        score_name="macro_f1",
+        global_step_transform=lambda _engine, _event: trainer.state.epoch,
     )
 
     pbar_eval = ProgressBar(persist=False, desc="Evaluating")
@@ -245,10 +286,10 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
         wandb.log({"lr": get_current_lr(optimizer)}, step=trainer.state.epoch)
 
         devel_metrics = epoch_metrics.get("devel", {})
-        devel_accuracy = devel_metrics.get("accuracy")
-        if devel_accuracy is not None:
-            if best_state["score"] is None or devel_accuracy > best_state["score"]:
-                best_state["score"] = devel_accuracy
+        devel_macro_f1 = devel_metrics.get("f1")
+        if devel_macro_f1 is not None:
+            if best_state["score"] is None or devel_macro_f1 > best_state["score"]:
+                best_state["score"] = devel_macro_f1
                 best_state["epoch"] = trainer.state.epoch
                 best_state["metrics"] = {
                     f"{split}_{key}": value
@@ -264,12 +305,16 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
         if best_state["metrics"]:
             payload = {
                 "best_epoch": best_state["epoch"],
-                "best_devel_accuracy": best_state["score"],
+                "best_devel_macro_f1": best_state["score"],
+                "best_devel_accuracy": best_state["metrics"]["devel_accuracy"],
                 "metrics": best_state["metrics"],
             }
             if wandb.run is not None:
                 wandb.run.summary["best_epoch"] = best_state["epoch"]
-                wandb.run.summary["best_devel_accuracy"] = best_state["score"]
+                wandb.run.summary["best_devel_macro_f1"] = best_state["score"]
+                wandb.run.summary["best_devel_accuracy"] = best_state["metrics"][
+                    "devel_accuracy"
+                ]
                 for key, value in best_state["metrics"].items():
                     wandb.run.summary[f"best_{key}"] = value
 
@@ -308,6 +353,7 @@ def create_transfer_learner(
     normalization_kwargs=None,
     unfreeze_warmup_epochs=3,
     unfreeze_blocks_per_epoch=1,
+    max_grad_norm=1.0,
 ):
     """Create a transfer learner with deterministic block-wise unfreezing."""
     if unfreeze_warmup_epochs < 0:
@@ -338,6 +384,7 @@ def create_transfer_learner(
         run_dir,
         eval_gpu_transforms,
         normalization_kwargs,
+        max_grad_norm,
     )
 
     if unfreeze_warmup_epochs == 0:

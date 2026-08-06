@@ -191,10 +191,6 @@ operation before being fed into the network. Images are cropped
 to the cutout_size parameter""",
 )
 @click.option(
-    "--force_reload/--no_force_reload",
-    default=False,
-)
-@click.option(
     "--train/--transfer_learn",
     default=True,
     help="""Specifies whether you wish to do transfer learning. If transfer learning,
@@ -274,7 +270,6 @@ def sweep_init(**kwargs):
             normalize=args["normalize"],
             transforms=T,
             split=k,
-            force_reload=args["force_reload"],
             num_classes=args["n_classes"]
         )
         for k in splits

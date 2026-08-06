@@ -60,7 +60,6 @@ def setup_ddp():
 @click.option("--crop/--no-crop", default=True)
 @click.option("--nesterov/--no-nesterov", default=False)
 @click.option("--dropout_rate", type=float, default=None)
-@click.option("--force_reload/--no_force_reload", default=False)
 @click.option("--expand_data", type=int, default=1)
 @click.option("--train/--transfer_learn", default=True)
 @click.option("--scheduler/--no_scheduler", default=True)
@@ -142,7 +141,6 @@ def train(**kwargs):
             split=k,
             num_classes=args["n_classes"],
             expand_factor=args["expand_data"] if k == "train" else 1,
-            force_reload=args["force_reload"]
         )
         for k in splits
     }

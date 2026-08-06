@@ -36,6 +36,22 @@ import random
 import numpy as np
 
 
+def _seed_training(seed):
+    """Seed every random source used by the main training process."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _seed_data_loader_worker(_worker_id):
+    """Give each DataLoader worker reproducible Python and NumPy RNGs."""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def _compute_balanced_class_weights(labels, num_classes, device):
     labels = np.asarray(labels, dtype=np.int64)
     counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
@@ -152,6 +168,13 @@ to what fraction is picked for train/devel/test.""",
 data_preprocessing loading process.""",
 )
 @click.option(
+    "--seed",
+    type=click.IntRange(min=0, max=(2 ** 32) - 1),
+    default=42,
+    show_default=True,
+    help="Seed model initialization, data shuffling, augmentation, and dropout.",
+)
+@click.option(
     "--loss",
     type=click.Choice(
         [
@@ -176,6 +199,13 @@ data_preprocessing loading process.""",
 )
 @click.option("--momentum", type=float, default=0.9)
 @click.option("--weight_decay", type=float, default=0)
+@click.option(
+    "--max-grad-norm",
+    type=click.FloatRange(min=0.0),
+    default=1.0,
+    show_default=True,
+    help="Clip the global gradient L2 norm before each optimizer step; 0 disables clipping.",
+)
 @click.option(
     "--optimizer",
     type=click.Choice(["sgd", "adamw"], case_sensitive=False),
@@ -234,10 +264,6 @@ to the cutout_size parameter""",
     in the specific model is used.""",
 )
 @click.option(
-    "--force_reload/--no_force_reload",
-    default=False,
-)
-@click.option(
     "--expand_data",
     type=int,
     default=1,
@@ -284,6 +310,9 @@ def train(**kwargs):
 
     # Copy and log args
     args = {k: v for k, v in kwargs.items()}
+
+    _seed_training(args["seed"])
+    logging.info("Using training seed %d.", args["seed"])
 
     try:
         validate_transfer_learning_options(
@@ -404,7 +433,6 @@ def train(**kwargs):
             split=k,
             num_classes=args["n_classes"],
             expand_factor=args["expand_data"] if k == "train" else 1,
-            force_reload=args["force_reload"]
         )
         for k in splits
     }
@@ -426,7 +454,19 @@ def train(**kwargs):
         args["normalization_vmin"] = stats["vmin"]
         args["normalization_vmax"] = stats["vmax"]
 
-    loaders = {k: loader_factory(v, shuffle=(k == 'train')) for k, v in datasets.items()}
+    # Keep each split's RNG independent so devel/test iteration cannot consume
+    # the training shuffle stream. The generator also supplies reproducible
+    # worker base seeds to _seed_data_loader_worker.
+    loaders = {}
+    for split_index, (split_name, dataset) in enumerate(datasets.items()):
+        generator = torch.Generator()
+        generator.manual_seed(args["seed"] + split_index)
+        loaders[split_name] = loader_factory(
+            dataset,
+            shuffle=(split_name == "train"),
+            generator=generator,
+            worker_init_fn=_seed_data_loader_worker,
+        )
     args["splits"] = {k: len(v.dataset) for k, v in loaders.items()}
 
     class_weights = None
@@ -469,6 +509,8 @@ def train(**kwargs):
                 "adamw_beta1": args["adamw_beta1"],
                 "adamw_beta2": args["adamw_beta2"],
                 "adamw_eps": args["adamw_eps"],
+                "max_grad_norm": args["max_grad_norm"],
+                "seed": args["seed"],
                 "epochs": args["epochs"],
                 "batch_size": args["batch_size"]
             }
@@ -485,10 +527,6 @@ def train(**kwargs):
         # Set up trainer
         if args["train"]:
             logging.info("Creating trainer...")
-            # Register a hook to automatically clamp gradients during the backward pass
-            for param in model.parameters():
-                param.register_hook(lambda grad: torch.clamp(grad, -1, 1))
-
             trainer = create_trainer(
                 model,
                 optimizer,
@@ -504,6 +542,7 @@ def train(**kwargs):
                 run_id=run.id,
                 num_epochs=args["epochs"],
                 run_dir=run_dir,
+                max_grad_norm=args["max_grad_norm"],
             )
         else:
             logging.info("Creating trainer and freezing layers for transfer learning...")
@@ -524,6 +563,7 @@ def train(**kwargs):
                 run_id=run.id,
                 num_epochs=args["epochs"],
                 run_dir=run_dir,
+                max_grad_norm=args["max_grad_norm"],
             )
 
         # Run trainer and save model state

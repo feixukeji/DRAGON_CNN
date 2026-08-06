@@ -1,5 +1,4 @@
 import json
-import logging
 
 import numpy as np
 import torch
@@ -138,19 +137,3 @@ def asinh_normalize(
 
 # Backward-compatible alias for the historical misspelling used by DRAGON.
 arsinh_normalize = asinh_normalize
-
-def load_tensor(filename, tensors_path, device="cpu", as_numpy=False):
-    """Load a Torch tensor from disk."""
-    try:
-        filename = filename + ".pt" if ".pt" not in filename else filename
-        tensor = torch.load(tensors_path / filename, map_location=device)
-        if not as_numpy:
-            return tensor
-        return tensor.numpy()
-    except Exception as e:
-        logging.error(f"ERROR: Failed to load tensor from {filename}: {e}")
-        raise
-
-def load_tensor_to_gpu(filename, tensors_path, device, as_numpy=False):
-    tensor = load_tensor(filename, tensors_path, as_numpy=False)
-    return tensor.to(device)

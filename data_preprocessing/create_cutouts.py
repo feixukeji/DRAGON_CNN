@@ -1,5 +1,7 @@
 import multiprocessing as mp
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
+from itertools import islice
 from pathlib import Path
 
 import click
@@ -17,13 +19,17 @@ except ImportError:  # Support direct execution as a script.
     from dataset import FITSDataset
 
 
+MAX_BATCH_ROWS = 64
+TARGET_BATCH_BYTES = 8 * 1024 * 1024
+PREFETCH_BATCHES_PER_WORKER = 4
+
+
 def process_single_object(task_args):
     """Process one object and return its HDF5 array, or ``None`` on failure."""
-    df_index, row, data_dir, bands, cutout_size, device_str = task_args
+    df_index, fits_paths, cutout_size, device_str = task_args
     channels = []
 
-    for band in bands:
-        fits_path = data_dir / str(row[band])
+    for fits_path in fits_paths:
         try:
             tensor_2d = FITSDataset.load_fits_as_tensor(fits_path, device=device_str)
             tensor_2d = center_crop_or_pad_torch(tensor_2d, cutout_size)
@@ -36,6 +42,70 @@ def process_single_object(task_args):
 
     # Return numpy array for saving to HDF5. cpu() ensures it's off the GPU.
     return df_index, stacked_tensor.cpu().numpy()
+
+
+def process_object_batch(task_batch):
+    """Process one ordered task batch into a contiguous HDF5 write block."""
+    successful_indices = []
+    arrays = []
+    for task_args in task_batch:
+        df_index, array = process_single_object(task_args)
+        if array is not None:
+            successful_indices.append(df_index)
+            arrays.append(array)
+
+    stacked = np.stack(arrays, axis=0) if arrays else None
+    return len(task_batch), successful_indices, stacked
+
+
+def _rows_per_batch(channel_count, cutout_size):
+    bytes_per_row = (
+        channel_count
+        * cutout_size
+        * cutout_size
+        * np.dtype('float32').itemsize
+    )
+    return max(1, min(MAX_BATCH_ROWS, TARGET_BATCH_BYTES // bytes_per_row))
+
+
+def _iter_task_batches(
+    df,
+    data_dir,
+    bands,
+    cutout_size,
+    device_str,
+    batch_rows,
+):
+    """Yield lightweight ordered task batches without materializing all rows."""
+    batch = []
+    band_rows = df.loc[:, list(bands)].itertuples(index=False, name=None)
+    for df_index, row_paths in enumerate(band_rows):
+        fits_paths = tuple(str(data_dir / str(path)) for path in row_paths)
+        batch.append((df_index, fits_paths, cutout_size, device_str))
+        if len(batch) == batch_rows:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _bounded_ordered_map(executor, function, items, max_pending):
+    """Map in submission order while bounding queued tasks and results."""
+    iterator = iter(items)
+    pending = deque(
+        executor.submit(function, item)
+        for item in islice(iterator, max_pending)
+    )
+    while pending:
+        future = pending.popleft()
+        result = future.result()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            pass
+        else:
+            pending.append(executor.submit(function, item))
+        yield result
 
 
 def create_cutout_tensors(
@@ -83,21 +153,14 @@ def create_cutout_tensors(
     )
     click.echo(f"Using {workers} workers. Compute Device: {device_str.upper()}")
 
-    # Package tasks with their original dataframe index
-    tasks = [
-        (i, row, data_dir, bands, cutout_size, device_str)
-        for i, (_, row) in enumerate(df.iterrows())
-    ]
-
     h5_path = out_dir / "tensors.h5"
 
     # Open HDF5 file in write mode
     with h5py.File(h5_path, 'w') as h5f:
         max_len = len(df)
 
-        # 1. Pre-allocate the FULL shape immediately (no shape=(0,...))
-        # 2. Chunk it by a larger number, like 64 or 128, to optimize batch reading
-        chunk_rows = min(64, max_len)
+        chunk_rows = min(MAX_BATCH_ROWS, max_len)
+        batch_rows = _rows_per_batch(len(bands), cutout_size)
         dset = h5f.create_dataset(
             "images",
             shape=(max_len, len(bands), cutout_size, cutout_size),
@@ -109,21 +172,34 @@ def create_cutout_tensors(
         current_h5_idx = 0
         successful_indices = []
 
-        # executor.map ensures results are returned in order
+        task_batches = _iter_task_batches(
+            df,
+            data_dir,
+            bands,
+            cutout_size,
+            device_str,
+            batch_rows,
+        )
         with ProcessPoolExecutor(
             max_workers=workers,
             mp_context=mp.get_context("spawn"),
         ) as executor:
-            results = executor.map(process_single_object, tasks)
+            results = _bounded_ordered_map(
+                executor,
+                process_object_batch,
+                task_batches,
+                max_pending=workers * PREFETCH_BATCHES_PER_WORKER,
+            )
+            with tqdm(total=max_len, unit='object') as progress:
+                for processed_count, batch_indices, numpy_batch in results:
+                    progress.update(processed_count)
+                    if numpy_batch is None:
+                        continue
+                    next_h5_idx = current_h5_idx + len(batch_indices)
+                    dset[current_h5_idx:next_h5_idx] = numpy_batch
+                    successful_indices.extend(batch_indices)
+                    current_h5_idx = next_h5_idx
 
-            for df_index, numpy_array in tqdm(results, total=len(tasks)):
-                if numpy_array is not None:
-                    # 3. Assign directly to the pre-allocated space (NO resizing in loop!)
-                    dset[current_h5_idx] = numpy_array
-                    successful_indices.append(df_index)
-                    current_h5_idx += 1
-
-        # 4. Do one final resize at the very end to trim any dropped/corrupted files
         if current_h5_idx < max_len:
             dset.resize(current_h5_idx, axis=0)
 
@@ -165,7 +241,7 @@ def create_cutout_tensors(
 @click.option(
     '--bands',
     multiple=True,
-    default=['g_band', 'i_band', 'r_band'],
+    default=['i_band', 'r_band', 'g_band'],
     help='List of columns for channels.',
 )
 @click.option(

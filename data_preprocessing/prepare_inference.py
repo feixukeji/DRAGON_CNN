@@ -90,8 +90,9 @@ def prepare_inference_data(
     labels_path: Path | str | None = None,
     normalization_stats_path: Path | str | None = None,
     force_preprocess: bool = False,
+    copy_artifacts: bool = True,
 ) -> PreparedInferenceData:
-    """Build inference metadata, reuse valid tensors, and copy model artifacts."""
+    """Build inference metadata and reuse valid tensors."""
     catalog = _resolve_file(catalog_path, "Catalog")
     cutouts = Path(cutout_dir).expanduser().resolve()
     output = Path(run_dir).expanduser().resolve()
@@ -138,10 +139,14 @@ def prepare_inference_data(
     raw_info_path = output / "raw_info.csv"
     info.to_csv(raw_info_path, index=False)
 
-    destination_labels = output / "labels.csv"
-    label_mapping_frame(label_mapping).to_csv(destination_labels, index=False)
-    destination_stats = output / "normalization_stats.json"
-    _copy_file(source_stats, destination_stats)
+    if copy_artifacts:
+        destination_labels = output / "labels.csv"
+        label_mapping_frame(label_mapping).to_csv(destination_labels, index=False)
+        destination_stats = output / "normalization_stats.json"
+        _copy_file(source_stats, destination_stats)
+    else:
+        destination_labels = source_labels
+        destination_stats = source_stats
 
     signature = _preprocessing_signature(
         raw_info_path,
@@ -219,6 +224,7 @@ def prepare_inference_data(
     type=click.Path(exists=True, dir_okay=False),
 )
 @click.option("--force-preprocess", is_flag=True)
+@click.option("--copy-artifacts/--no-copy-artifacts", default=True)
 def main(**kwargs) -> None:
     """Prepare metadata and tensors for DRAGON inference."""
     try:

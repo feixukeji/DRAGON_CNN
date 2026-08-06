@@ -5,7 +5,7 @@ DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch CNN pipeline for
 ## What is in this repository
 
 - PyTorch models for DRAGON and related variants.
-- FITS preprocessing to tensors (HDF5 or legacy per-image .pt files).
+- FITS preprocessing to an HDF5 tensor store.
 - Train and evaluate with PyTorch Ignite and W&B logging.
 - Inference, Grad-CAM heatmap creation, and ensemble voting.
 - Notebooks, simulation helpers, and legacy TensorFlow experiments.
@@ -40,10 +40,7 @@ Notes:
 
 ## Data preparation
 
-The data loader supports two formats:
-
-1) HDF5 tensors (recommended, fast)
-2) Legacy per-image .pt tensors (auto-generated)
+The data loader requires an HDF5 tensor store with `object_id` metadata.
 
 Survey integrations build `raw_info.csv` and `labels.csv` with
 `data_preprocessing.prepare_training.prepare_training_catalog`. They supply
@@ -51,11 +48,11 @@ their own catalog and cutout paths through `ClassSpec`; band names are used as
 provided. Individual classes may be empty, but the combined dataset must retain
 at least one row.
 
-### HDF5 pipeline (recommended)
+### HDF5 pipeline
 
 1. Prepare a metadata CSV with at least:
-	 - An identifier column such as object_id
-	 - Band columns (default: g_band, i_band, r_band) with FITS file paths
+	 - An `object_id` identifier column
+	 - Band columns (default: i_band, r_band, g_band) with FITS file paths
 	 - A label column for training (default used by training is class)
 
 2. Generate tensors:
@@ -65,7 +62,7 @@ python data_preprocessing/create_cutouts.py \
 	--data-dir /path/to/fits_root \
 	--csv-path /path/to/metadata.csv \
 	--out-dir /path/to/data_dir/tensors \
-	--bands g_band --bands i_band --bands r_band \
+	--bands i_band --bands r_band --bands g_band \
 	--cutout-size 94
 ```
 
@@ -102,10 +99,6 @@ data_dir/
 		tensors.h5
 ```
 
-### Legacy .pt pipeline
-
-If your info.csv uses file_name instead of object_id, the loader will fall back to a legacy path and generate one .pt tensor per image in data_dir/tensors/. Place raw FITS files in data_dir/cutouts/ or directly under data_dir/ so they can be found by file_name.
-
 ## Training
 
 The main training entrypoint is train/train.py and logs to W&B.
@@ -125,6 +118,8 @@ python train/train.py \
 
 Key behavior:
 - Saves checkpoints to checkpoints/ and final weights to models/.
+- Uses `--seed 42` by default for reproducible model initialization, data
+  shuffling, training augmentation, dropout, and DataLoader workers.
 - With `--normalize` (the default), applies the Euclid YOLO stretch independently
   to each cutout/channel: clip at the 0.5/99.5 percentiles, map to `[0, 1]`, then
   apply `asinh(x / 0.1) / asinh(1 / 0.1)`.
@@ -228,12 +223,13 @@ The sweep entrypoint supports both dragon and resnet model types.
 
 Use `scripts/report_training_results.py` to summarize locally stored W&B confusion
 matrices, aggregate metrics, and per-class metrics. It reports the best devel
-step by accuracy by default; use `--selection latest` to report the latest
+step by macro-F1 by default; use `--selection latest` to report the latest
 table for each split instead. Parent-directory scans support both
 `wandb/run-*` and `wandb/offline-run-*` layouts.
 
-For the default accuracy selection, the reporter uses the trainer's recorded
-`best_epoch` when available. Every split in a best-step report comes from that
+For the default macro-F1 selection, the reporter uses the trainer's recorded
+`best_epoch` when available. Legacy accuracy-selected runs are recomputed from
+their stored confusion tables. Every split in a best-step report comes from that
 same step; a missing split is reported as unavailable rather than substituted
 from another epoch. Loss is shown only when W&B summary metadata identifies it
 as belonging to the selected step. The trainer's `best_metrics.json` is used as

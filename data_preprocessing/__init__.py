@@ -10,7 +10,15 @@ from .normalization import (
 )
 
 
-def get_data_loader(dataset, batch_size, n_workers, shuffle=True, sampler=None):
+def get_data_loader(
+    dataset,
+    batch_size,
+    n_workers,
+    shuffle=True,
+    sampler=None,
+    generator=None,
+    worker_init_fn=None,
+):
     # IMPORTANT: If a sampler is provided, shuffle MUST be False.
     # The DistributedSampler handles the shuffling internally.
     if sampler is not None:
@@ -23,6 +31,8 @@ def get_data_loader(dataset, batch_size, n_workers, shuffle=True, sampler=None):
         "num_workers": n_workers,
         "sampler": sampler,
         "pin_memory": torch.cuda.is_available(),
+        "generator": generator,
+        "worker_init_fn": worker_init_fn,
     }
     if n_workers > 0:
         loader_kwargs.update(

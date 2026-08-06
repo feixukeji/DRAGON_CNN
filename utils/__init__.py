@@ -9,8 +9,6 @@ from .tensor_utils import (
     asinh_normalize,
     load_asinh_stats,
     normalization_kwargs_from_stats,
-    load_tensor,
-    load_tensor_to_gpu,
 )
 from .model_utils import (
     enable_dropout,
@@ -22,7 +20,7 @@ from .optimizer_utils import build_optimizer
 from .training_utils import validate_transfer_learning_options
 
 __all__ = [
-    "load_data_dir", "discover_devices", "load_tensor", "load_tensor_to_gpu",
+    "load_data_dir", "discover_devices",
     "center_crop_or_pad_torch", "arsinh_normalize", "asinh_normalize",
     "load_asinh_stats", "DEFAULT_LOW_PERCENTILE", "DEFAULT_HIGH_PERCENTILE",
     "normalization_kwargs_from_stats",
