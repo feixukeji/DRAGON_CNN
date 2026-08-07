@@ -1,3 +1,1 @@
-from .inference import predict
-
-__all__ = ["predict"]
+"""Inference and visualization command-line modules."""

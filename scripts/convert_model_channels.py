@@ -7,21 +7,14 @@ from pathlib import Path
 
 import torch
 
-from utils.model_utils import unwrap_state_dict
+from utils.model_utils import load_plain_state_dict
 
 
 def _find_conv_key(state_dict: dict[str, torch.Tensor]) -> str:
-    preferred = [
-        "layer1.0.weight",
-        "model.conv1.weight",
-    ]
-    for key in preferred:
-        if key in state_dict:
-            return key
-    for key in state_dict:
-        if key.endswith("conv1.weight") or key.endswith("layer1.0.weight"):
-            return key
-    raise KeyError("Unable to locate first conv weight in state_dict")
+    key = "layer1.0.weight"
+    if key not in state_dict:
+        raise KeyError(f"DRAGON checkpoint is missing {key!r}")
+    return key
 
 
 def _adapt_conv_weight(weight: torch.Tensor, target_channels: int) -> torch.Tensor:
@@ -49,18 +42,13 @@ def _adapt_conv_weight(weight: torch.Tensor, target_channels: int) -> torch.Tens
 def _find_classifier_pairs(
     state_dict: dict[str, torch.Tensor],
 ) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    suffixes = [
-        "fc2.weight",
-        "model.fc.4.weight",
-    ]
-    for key in state_dict:
-        for suffix in suffixes:
-            if key.endswith(suffix):
-                bias_key = key.removesuffix("weight") + "bias"
-                if bias_key in state_dict:
-                    pairs.append((key, bias_key))
-    return pairs
+    weight_key = "fc2.weight"
+    bias_key = "fc2.bias"
+    if weight_key not in state_dict or bias_key not in state_dict:
+        raise KeyError(
+            f"DRAGON checkpoint must contain {weight_key!r} and {bias_key!r}"
+        )
+    return [(weight_key, bias_key)]
 
 
 def _adapt_classifier(
@@ -119,8 +107,7 @@ def main() -> None:
     if args.target_classes is not None and args.target_classes <= 0:
         parser.error("--target-classes must be positive")
 
-    state = torch.load(args.in_model, map_location="cpu")
-    state_dict = unwrap_state_dict(state)
+    state_dict = load_plain_state_dict(args.in_model)
 
     conv_key = _find_conv_key(state_dict)
     weight = state_dict[conv_key]

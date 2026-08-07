@@ -1,4 +1,5 @@
 from astropy.io import fits
+import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -10,9 +11,6 @@ import torch.multiprocessing as mp
 
 from utils import load_data_dir
 
-import logging
-
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 mp.set_sharing_strategy("file_system")
 
 
@@ -21,13 +19,12 @@ class FITSDataset(Dataset):
 
     def __init__(
             self,
-            data_dir='/dev/null',
+            data_dir,
             label_col="class",
             slug=None,
             split=None,
             transforms=None,
             load_labels=True,
-            expand_factor=1
     ):
         # Set data directories
         self.data_dir = Path(data_dir)
@@ -35,7 +32,6 @@ class FITSDataset(Dataset):
 
         # Initialize image metadata
         self.transform = transforms
-        self.expand_factor = expand_factor
 
         # Define paths and load dataframe.
         self.data_info = load_data_dir(self.data_dir, slug, split)
@@ -71,12 +67,66 @@ class FITSDataset(Dataset):
             )
 
         if "h5_index" not in self.data_info.columns:
-            logging.warning(
-                "No 'h5_index' column found; assuming a 1:1 row mapping."
+            raise KeyError(
+                "Metadata CSV must contain 'h5_index'; implicit row-to-HDF5 "
+                "mapping is unsupported. Regenerate the metadata with "
+                "create_cutouts.py."
             )
-            self.h5_indices = np.arange(len(self.data_info))
-        else:
-            self.h5_indices = np.asarray(self.data_info["h5_index"])
+
+        h5_index = self.data_info["h5_index"]
+        numeric_h5_index = pd.to_numeric(h5_index, errors="coerce")
+        invalid_mask = numeric_h5_index.isna() | ~np.isfinite(numeric_h5_index)
+        invalid_mask |= numeric_h5_index % 1 != 0
+        invalid_mask |= numeric_h5_index < np.iinfo(np.int64).min
+        invalid_mask |= numeric_h5_index > np.iinfo(np.int64).max
+        if invalid_mask.any():
+            invalid_rows = self.data_info.index[invalid_mask].tolist()[:5]
+            raise ValueError(
+                "Metadata column 'h5_index' must contain finite integers; "
+                f"invalid CSV row index(es): {invalid_rows}"
+            )
+
+        self.h5_indices = numeric_h5_index.to_numpy(dtype=np.int64)
+        negative_mask = self.h5_indices < 0
+        if negative_mask.any():
+            invalid_rows = self.data_info.index[negative_mask].tolist()[:5]
+            raise ValueError(
+                "Metadata column 'h5_index' cannot contain negative values; "
+                f"invalid CSV row index(es): {invalid_rows}"
+            )
+
+        duplicated_mask = pd.Series(self.h5_indices).duplicated(keep=False)
+        if duplicated_mask.any():
+            duplicate_values = np.unique(self.h5_indices[duplicated_mask])[:5].tolist()
+            raise ValueError(
+                "Metadata column 'h5_index' must map each row to a unique image; "
+                f"duplicate value(s): {duplicate_values}"
+            )
+
+        with h5py.File(self.h5_path, "r") as h5_file:
+            if "images" not in h5_file:
+                raise KeyError(f"HDF5 dataset 'images' not found in {self.h5_path}")
+            images = h5_file["images"]
+            if not isinstance(images, h5py.Dataset) or images.ndim != 4:
+                raise ValueError(
+                    "HDF5 dataset 'images' must have shape (N, C, H, W); "
+                    f"received {getattr(images, 'shape', None)} in {self.h5_path}"
+                )
+            if any(dimension <= 0 for dimension in images.shape[1:]):
+                raise ValueError(
+                    "HDF5 dataset 'images' must have non-empty C, H, and W "
+                    f"dimensions; received {images.shape} in {self.h5_path}"
+                )
+            image_count = images.shape[0]
+
+        out_of_bounds_mask = self.h5_indices >= image_count
+        if out_of_bounds_mask.any():
+            invalid_rows = self.data_info.index[out_of_bounds_mask].tolist()[:5]
+            invalid_values = self.h5_indices[out_of_bounds_mask][:5].tolist()
+            raise IndexError(
+                f"Metadata 'h5_index' exceeds HDF5 image count ({image_count}); "
+                f"CSV row index(es) {invalid_rows} contain value(s) {invalid_values}"
+            )
 
         logging.info(
             "Initialized HDF5 dataset: rows=%d path=%s",
@@ -91,25 +141,16 @@ class FITSDataset(Dataset):
             self.h5_file = h5py.File(self.h5_path, 'r', swmr=True, rdcc_nbytes=1024 ** 2 * 512)
             self.h5_images = self.h5_file['images']
 
-            max_requested_idx = np.max(self.h5_indices)
-            actual_max_idx = self.h5_images.shape[0] - 1
-
-            if max_requested_idx > actual_max_idx:
-                # Log the warning so you are aware of the mismatch
-                logging.warning(
-                    f"Dataset mismatch: CSV requests up to index {max_requested_idx}, "
-                    f"but HDF5 only goes up to {actual_max_idx}. Clamping indices to prevent crashes."
-                )
-                # Clip any out-of-bounds indices to the maximum valid index
-                self.h5_indices = np.clip(self.h5_indices, 0, actual_max_idx)
-
     def __getitem__(self, index):
         if isinstance(index, slice):
             start, stop, step = index.indices(len(self))
             return [self[i] for i in range(start, stop, step)]
         elif isinstance(index, int):
-
-            idx = index % len(self.labels)
+            idx = index
+            if idx < 0:
+                idx += len(self.labels)
+            if idx < 0 or idx >= len(self.labels):
+                raise IndexError(f"Dataset index out of range: {index}")
 
             self._lazy_init_h5()
             true_h5_idx = int(self.h5_indices[idx])
@@ -117,12 +158,12 @@ class FITSDataset(Dataset):
             pt = torch.from_numpy(pt_np)
 
             label = torch.tensor(int(self.labels[idx]), dtype=torch.long)
-            return pt.squeeze(1), label
+            return pt, label
         else:
             raise TypeError(f"Invalid argument type: {type(index)}")
 
     def __len__(self):
-        return len(self.labels) * self.expand_factor
+        return len(self.labels)
 
     def __del__(self):
         """Gracefully close the HDF5 file handle upon garbage collection."""
@@ -133,7 +174,7 @@ class FITSDataset(Dataset):
                 pass
 
     @staticmethod
-    def load_fits_as_tensor(filename, device="cpu"):
+    def load_fits_as_tensor(filename):
         """Open a FITS file and convert it to a Torch tensor, hunting for the correct HDU."""
         fits_np = None
 
@@ -163,9 +204,5 @@ class FITSDataset(Dataset):
         # Replace NaNs and convert to float32 tensor
         fits_np = np.nan_to_num(fits_np, nan=0.0)
         tensor = torch.from_numpy(fits_np.astype(np.float32))
-
-        # Move to requested device
-        if device == 'cuda' or (isinstance(device, str) and device.startswith('cuda')):
-            tensor = tensor.to(device)
 
         return tensor

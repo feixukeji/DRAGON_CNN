@@ -1,21 +1,15 @@
 import torch.nn as nn
 
-class DRAGON(nn.Module):
-    def __init__(self, cutout_size=94, channels=1, num_classes=6):
-        super(DRAGON, self).__init__()
-        self.cutout_size = cutout_size
-        self.channels = channels
-        self.expected_input_shape = (
-            16,
-            self.channels,
-            self.cutout_size,
-            self.cutout_size,
-        )
 
-        self.num_classes = num_classes
+DRAGON_CUTOUT_SIZE = 96
+
+
+class DRAGON(nn.Module):
+    def __init__(self, channels=1, num_classes=6):
+        super().__init__()
 
         self.layer1 = nn.Sequential(
-            nn.Conv2d(self.channels, 64, kernel_size=(3, 3), padding='same'),
+            nn.Conv2d(channels, 64, kernel_size=(3, 3), padding='same'),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(),
             nn.AvgPool2d(kernel_size=2, stride=2)
@@ -69,9 +63,6 @@ class DRAGON(nn.Module):
 
     def forward(self, x):
         # Forward pass through the layers
-        if x.dim() == 5 and x.size(1) == 1:
-            x = x.squeeze(1)
-
         out = self.layer1(x)
         out = self.layer2(out)
         out = self.layer3(out)

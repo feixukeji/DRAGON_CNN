@@ -26,12 +26,12 @@ PREFETCH_BATCHES_PER_WORKER = 4
 
 def process_single_object(task_args):
     """Process one object and return its HDF5 array, or ``None`` on failure."""
-    df_index, fits_paths, cutout_size, device_str = task_args
+    df_index, fits_paths, cutout_size = task_args
     channels = []
 
     for fits_path in fits_paths:
         try:
-            tensor_2d = FITSDataset.load_fits_as_tensor(fits_path, device=device_str)
+            tensor_2d = FITSDataset.load_fits_as_tensor(fits_path)
             tensor_2d = center_crop_or_pad_torch(tensor_2d, cutout_size)
             channels.append(tensor_2d)
         except Exception:
@@ -40,8 +40,7 @@ def process_single_object(task_args):
 
     stacked_tensor = torch.stack(channels, dim=0)
 
-    # Return numpy array for saving to HDF5. cpu() ensures it's off the GPU.
-    return df_index, stacked_tensor.cpu().numpy()
+    return df_index, stacked_tensor.numpy()
 
 
 def process_object_batch(task_batch):
@@ -73,7 +72,6 @@ def _iter_task_batches(
     data_dir,
     bands,
     cutout_size,
-    device_str,
     batch_rows,
 ):
     """Yield lightweight ordered task batches without materializing all rows."""
@@ -81,7 +79,7 @@ def _iter_task_batches(
     band_rows = df.loc[:, list(bands)].itertuples(index=False, name=None)
     for df_index, row_paths in enumerate(band_rows):
         fits_paths = tuple(str(data_dir / str(path)) for path in row_paths)
-        batch.append((df_index, fits_paths, cutout_size, device_str))
+        batch.append((df_index, fits_paths, cutout_size))
         if len(batch) == batch_rows:
             yield batch
             batch = []
@@ -113,9 +111,8 @@ def create_cutout_tensors(
     csv_path,
     out_dir,
     bands,
-    cutout_size=94,
+    cutout_size=96,
     workers=4,
-    use_gpu=False,
 ):
     """Pack FITS files into HDF5 and write row-aligned clean metadata."""
     data_dir = Path(data_dir)
@@ -145,13 +142,11 @@ def create_cutout_tensors(
     if df.empty:
         raise ValueError(f"Metadata CSV contains no rows: {csv_path}")
 
-    device_str = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
-
     click.echo(
         f"Processing up to {len(df)} objects into "
         f"{len(bands)}-channel tensors..."
     )
-    click.echo(f"Using {workers} workers. Compute Device: {device_str.upper()}")
+    click.echo(f"Using {workers} CPU workers.")
 
     h5_path = out_dir / "tensors.h5"
 
@@ -177,7 +172,6 @@ def create_cutout_tensors(
             data_dir,
             bands,
             cutout_size,
-            device_str,
             batch_rows,
         )
         with ProcessPoolExecutor(
@@ -247,7 +241,8 @@ def create_cutout_tensors(
 @click.option(
     '--cutout-size',
     type=int,
-    default=94,
+    default=96,
+    show_default=True,
     help='Final square size of the cutouts.',
 )
 @click.option(
@@ -256,12 +251,7 @@ def create_cutout_tensors(
     default=4,
     help='Number of parallel CPU workers for disk I/O.',
 )
-@click.option(
-    '--use-gpu/--no-gpu',
-    default=False,
-    help='Flag to push tensor operations to GPU.',
-)
-def generate_tensors(data_dir, csv_path, out_dir, bands, cutout_size, workers, use_gpu):
+def generate_tensors(data_dir, csv_path, out_dir, bands, cutout_size, workers):
     """Preprocess FITS files into HDF5 and aligned clean metadata."""
     try:
         create_cutout_tensors(
@@ -271,7 +261,6 @@ def generate_tensors(data_dir, csv_path, out_dir, bands, cutout_size, workers, u
             bands=bands,
             cutout_size=cutout_size,
             workers=workers,
-            use_gpu=use_gpu,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc

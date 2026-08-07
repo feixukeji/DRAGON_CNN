@@ -6,7 +6,12 @@ from pathlib import Path
 import click
 
 from data_preprocessing import FITSDataset, compute_asinh_stats, save_asinh_stats
-from utils import DEFAULT_HIGH_PERCENTILE, DEFAULT_LOW_PERCENTILE
+from utils import (
+    DEFAULT_ASINH_SOFTENING,
+    DEFAULT_HIGH_PERCENTILE,
+    DEFAULT_LOW_PERCENTILE,
+    validate_asinh_softening,
+)
 
 
 @click.command()
@@ -16,6 +21,12 @@ from utils import DEFAULT_HIGH_PERCENTILE, DEFAULT_LOW_PERCENTILE
 @click.option("--channels", type=int, default=1, show_default=True)
 @click.option("--low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True)
 @click.option("--high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True)
+@click.option(
+    "--asinh-softening",
+    type=float,
+    default=DEFAULT_ASINH_SOFTENING,
+    show_default=True,
+)
 @click.option("--sample-per-image", type=int, default=1000, show_default=True)
 @click.option("--max-samples-per-channel", type=int, default=2000000, show_default=True)
 @click.option("--seed", type=int, default=42, show_default=True)
@@ -32,6 +43,7 @@ def main(
     channels,
     low_pct,
     high_pct,
+    asinh_softening,
     sample_per_image,
     max_samples_per_channel,
     seed,
@@ -43,6 +55,13 @@ def main(
             "must satisfy 0 <= low < high <= 100",
             param_hint="--low-pct/--high-pct",
         )
+    try:
+        asinh_softening = validate_asinh_softening(asinh_softening)
+    except ValueError as exc:
+        raise click.BadParameter(
+            "must be a finite positive number",
+            param_hint="--asinh-softening",
+        ) from exc
     if sample_per_image < 0 or max_samples_per_channel < 0:
         raise click.BadParameter(
             "must be non-negative",
@@ -60,6 +79,7 @@ def main(
         channels=channels,
         low_pct=low_pct,
         high_pct=high_pct,
+        softening=asinh_softening,
         sample_per_image=sample_per_image,
         max_samples_per_channel=max_samples_per_channel,
         seed=seed,

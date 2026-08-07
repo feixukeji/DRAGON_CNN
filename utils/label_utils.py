@@ -34,13 +34,3 @@ def load_label_mapping(path, expected_classes=None):
             f"{labels_path}"
         )
     return dict(sorted(zip(values.tolist(), keys.tolist())))
-
-
-def label_mapping_frame(mapping):
-    """Convert an index-to-name mapping to canonical labels.csv columns."""
-    return pd.DataFrame(
-        {
-            "key": [mapping[index] for index in sorted(mapping)],
-            "value": sorted(mapping),
-        }
-    )

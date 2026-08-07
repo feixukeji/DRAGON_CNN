@@ -1,27 +1,27 @@
 # DRAGON_CNN
 
-DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch CNN pipeline for multi-class classification of astronomical cutouts. This repository contains data preprocessing for FITS images, model training, inference with optional Monte Carlo dropout, Grad-CAM heatmaps, and an ensemble voting utility.
+DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch CNN pipeline
+for multi-class classification of astronomical cutouts. This repository
+contains FITS preprocessing, model training, deterministic inference, and
+EigenGradCAM heatmaps.
 
 ## What is in this repository
 
-- PyTorch models for DRAGON and related variants.
+- The PyTorch DRAGON model architecture.
 - FITS preprocessing to an HDF5 tensor store.
-- Train and evaluate with PyTorch Ignite and W&B logging.
-- Inference, Grad-CAM heatmap creation, and ensemble voting.
-- Notebooks, simulation helpers, and legacy TensorFlow experiments.
+- Training and evaluation with PyTorch Ignite and W&B logging.
+- Inference, heatmap, and local training-report command-line tools.
 
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| cnn/ | DRAGON CNN definition, ResNet50 variant, and a larger-cutout model. |
-| data_preprocessing/ | Training metadata, FITS tensor creation, and split generation. |
+| cnn/ | DRAGON CNN definition. |
+| data_preprocessing/ | Training metadata, FITS tensor creation, split generation, and normalization statistics. |
 | train/ | Single-device training entrypoint and PyTorch Ignite trainer. |
 | scripts/ | Checkpoint conversion and local training-report utilities. |
-| modules/ | Inference, heatmap generation, ensemble voting, and notebooks. |
-| models/ | Example trained weights and voter model sets. |
+| modules/ | Inference and heatmap generation. |
 | utils/ | Data, device, and tensor helpers. |
-| tensorflow/ | Legacy TensorFlow dual_finder pipeline and utilities. |
 
 ## Installation
 
@@ -31,16 +31,23 @@ Recommended workflow:
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-pip install -e .
 ```
 
+Python 3.10 or newer is required. Run commands from the repository root so the
+top-level packages are importable.
+
 Notes:
+
 - A GPU is strongly recommended for training and heatmap generation.
-- Training requires a valid W&B login (see W&B docs).
+- Online W&B logging requires a login; set `WANDB_MODE=offline` to train
+  without network logging.
 
 ## Data preparation
 
-The data loader requires an HDF5 tensor store with `object_id` metadata.
+The dataset is a long-lived data asset, separate from training experiments. In
+the examples below it is stored at `/path/to/dragon_dataset`. Its
+`labels.csv` and `normalization_stats.json` remain in that directory and are
+not copied into individual experiments.
 
 Survey integrations build `raw_info.csv` and `labels.csv` with
 `data_preprocessing.prepare_training.prepare_training_catalog`. They supply
@@ -51,89 +58,129 @@ at least one row.
 ### HDF5 pipeline
 
 1. Prepare a metadata CSV with at least:
-	 - An `object_id` identifier column
-	 - Band columns (default: i_band, r_band, g_band) with FITS file paths
-	 - A label column for training (default used by training is class)
 
-2. Generate tensors:
+   - An `object_id` identifier column.
+   - Band columns (for example `i_band`, `r_band`, and `g_band`) containing
+     FITS file paths.
+   - A training label column named `class` by default.
 
-```bash
-python data_preprocessing/create_cutouts.py \
-	--data-dir /path/to/fits_root \
-	--csv-path /path/to/metadata.csv \
-	--out-dir /path/to/data_dir/tensors \
-	--bands i_band --bands r_band --bands g_band \
-	--cutout-size 94
-```
-
-This creates:
-- /path/to/data_dir/tensors/tensors.h5
-- /path/to/data_dir/tensors/clean_info.csv
-
-3. Place metadata where the loader expects it:
+2. Generate 96-pixel tensors:
 
 ```bash
-cp /path/to/data_dir/tensors/clean_info.csv /path/to/data_dir/info.csv
+python -m data_preprocessing.create_cutouts \
+  --data-dir /path/to/fits_root \
+  --csv-path /path/to/metadata.csv \
+  --out-dir /path/to/dragon_dataset/tensors \
+  --bands i_band --bands r_band --bands g_band \
+  --cutout-size 96
 ```
 
-4. Create stratified train/devel/test splits that retain the original class
-   frequencies (and add `h5_index` for HDF5):
+This creates `tensors/tensors.h5` and `tensors/clean_info.csv`.
+
+3. Publish the aligned metadata:
 
 ```bash
-python data_preprocessing/make_splits.py \
-	--data_dir /path/to/data_dir \
-	--target_metric class \
-	--info_name info.csv
+cp /path/to/dragon_dataset/tensors/clean_info.csv \
+  /path/to/dragon_dataset/info.csv
 ```
 
-Expected layout after preprocessing:
+4. Create one deterministic, stratified train/devel/test split set. The
+   default split slug is `stratified`.
 
+```bash
+python -m data_preprocessing.make_splits \
+  --data-dir /path/to/dragon_dataset \
+  --label-col class \
+  --info-name info.csv
 ```
-data_dir/
-	info.csv
-	labels.csv                 # optional mapping of label keys to numeric values
-	splits/
-		unbalanced-dev-train.csv
-		unbalanced-dev-devel.csv
-		unbalanced-dev-test.csv
-	tensors/
-		tensors.h5
+
+The default fractions are 0.70/0.15/0.15. Override them with
+`--train-fraction`, `--devel-fraction`, and `--test-fraction`; they must sum to
+one. Every metadata row must contain a unique integer `h5_index` within the
+HDF5 tensor range. The loader fails on a missing or invalid mapping instead of
+guessing or clamping an index.
+
+5. Compute the global asinh normalization statistics from the training split:
+
+```bash
+python -m data_preprocessing.compute_normalization_stats \
+  --data-dir /path/to/dragon_dataset \
+  --split-slug stratified \
+  --split train \
+  --channels 3 \
+  --asinh-softening 0.1 \
+  --output /path/to/dragon_dataset/normalization_stats.json
+```
+
+This statistics-generation stage is the only stage that accepts the asinh
+softening value. The JSON records `vmin`, `vmax`, and `softening` together;
+training, inference, and heatmap generation only read those stored values.
+
+Expected dataset layout:
+
+```text
+dragon_dataset/
+  info.csv
+  labels.csv
+  normalization_stats.json
+  splits/
+    stratified-train.csv
+    stratified-devel.csv
+    stratified-test.csv
+  tensors/
+    tensors.h5
 ```
 
 ## Training
 
-The main training entrypoint is `python -m train.train` and logs to W&B. It selects a
-single CUDA device when available and otherwise uses the CPU; multi-process and
-multi-device training are not supported. The example below is a generic
-six-class, 94-pixel configuration; set the dimensions and class count for your
-dataset.
+The main entrypoint is `python -m train.train`. It selects one CUDA device when
+available and otherwise uses the CPU; multi-process and multi-device training
+are not supported. The following example trains a six-class, three-channel,
+96-pixel model:
 
 ```bash
 python -m train.train \
-	--experiment_name dragon \
-	--data_dir /path/to/data_dir \
-	--split_slug unbalanced-dev \
-	--cutout_size 94 \
-	--channels 3 \
-	--n_classes 6 \
-	--epochs 40 \
-	--batch_size 16 \
-	--optimizer sgd
+  --experiment_name dragon \
+  --data_dir /path/to/dragon_dataset \
+  --run_dir /path/to/dragon_runs \
+  --split_slug stratified \
+  --cutout_size 96 \
+  --channels 3 \
+  --n_classes 6 \
+  --epochs 40 \
+  --batch_size 16 \
+  --optimizer sgd
 ```
 
-Key behavior:
-- Saves checkpoints to `RUN_DIR/checkpoints/` and final weights to
-  `RUN_DIR/models/`; `RUN_DIR` defaults to `DATA_DIR`.
-- Uses `--seed 42` by default for reproducible model initialization, data
+Training requires `/path/to/dragon_dataset/normalization_stats.json` to
+already exist. It always applies global asinh normalization using the JSON's
+per-channel limits and softening; it never computes statistics or accepts a
+separate softening value.
+
+`--run_dir` is the shared run root. Each `--experiment_name` owns exactly one
+experiment directory:
+
+```text
+dragon_runs/
+  dragon/
+    model.pt
+    best_metrics.json
+    wandb/
+```
+
+Only the completed-epoch model with the best devel macro-F1 is saved as
+`model.pt`; there is no final model or separate checkpoints directory. Starting
+another training job with the same experiment name replaces that entire
+experiment directory, including any earlier inference products beneath it.
+Use distinct experiment names for results that must coexist.
+
+Other behavior:
+
+- `--seed 42` is the default for reproducible model initialization, data
   shuffling, training augmentation, dropout, and DataLoader workers.
-- With `--normalize` (the default), clips at the 0.5/99.5 percentiles, maps to
-  `[0, 1]`, then applies `asinh(x / 0.1) / asinh(1 / 0.1)`. Without
-  `--normalization-stats`, percentiles are computed independently per
-  cutout/channel; with a statistics file, every cutout uses its fixed
-  training-set per-channel limits.
-- Applies `--crop` center-cropping and train-only `--augment` dihedral transforms
-  on the selected device.
-- Training expects a label column named class in info.csv by default.
+- `--crop` applies center-cropping and `--augment` applies train-only dihedral
+  transforms on the selected device.
+- The training label column is `class` by default.
 
 The optimizer can be selected without changing code:
 
@@ -141,165 +188,142 @@ The optimizer can be selected without changing code:
 # Momentum SGD (the default)
 python -m train.train ... --optimizer sgd --lr0 1e-3 --momentum 0.9 --nesterov
 
-# AdamW; momentum/nesterov are ignored
+# AdamW; momentum and nesterov are ignored
 python -m train.train ... --optimizer adamw --lr0 3e-5 --weight_decay 1e-4
 ```
 
 AdamW uses `--adamw-beta1`, `--adamw-beta2`, and `--adamw-eps`; bias and
 normalization parameters are excluded from weight decay.
 
-The percentile limits and softening are configurable with
-`--normalize-low-pct`, `--normalize-high-pct`, and `--asinh-softening`.
-For fixed limits shared by every cutout, pass a statistics path. Training loads
-the file if it exists; otherwise it automatically computes per-channel limits
-from the training split only and saves the file:
+### Transfer learning
 
-```bash
-python -m train.train \
-	--data_dir /path/to/data_dir \
-	--split_slug unbalanced-dev \
-	--channels 3 \
-	--normalization-stats /path/to/data_dir/normalization_stats.json
-```
-
-Statistics can also be generated explicitly before training:
-
-```bash
-python -m data_preprocessing.compute_normalization_stats \
-	--data-dir /path/to/data_dir \
-	--split-slug unbalanced-dev \
-	--split train \
-	--channels 3 \
-	--output /path/to/data_dir/normalization_stats.json
-```
-
-The JSON format is compatible with `Euclid_Q1/YOLO/fits_to_tiff.py` and must
-contain per-channel `vmin` and `vmax` arrays. Models trained with the former
-raw `asinh(x)` preprocessing need retraining before using this normalized
-stretch. Inference requires this training-time file to already exist and never
-recomputes statistics from inference data.
-
-Transfer learning:
-
+Model weights are not distributed in this Git repository. Use the `model.pt`
+produced by the current DRAGON trainer. Wrapped `state_dict`/`model` checkpoint
+dictionaries and DataParallel `module.` prefixes are intentionally unsupported.
 When the target dataset has a different number of image channels or classes,
-adapt the pretrained checkpoint first:
+adapt the model in a temporary location first:
 
 ```bash
 python -m scripts.convert_model_channels \
-	--in-model models/glowing-capybara-20.pt \
-	--out-model /path/to/run/model_adapted.pt \
-	--target-channels 4 \
-	--target-classes 9
+  --in-model /path/to/pretrained/model.pt \
+  --out-model /tmp/dragon-model-adapted.pt \
+  --target-channels 4 \
+  --target-classes 9
 ```
 
-`--target-channels` is required so dataset-specific channel counts remain in
-the calling pipeline. `--target-classes` is optional; when supplied, matching
-classifier weights are reinitialized for that output size.
+`--target-channels` is required. `--target-classes` is optional; when supplied,
+matching classifier weights are reinitialized for that output size.
 
 ```bash
 python -m train.train \
-	--transfer_learn \
-	--unfreeze-warmup-epochs 3 \
-	--unfreeze-blocks-per-epoch 1 \
-	--lr0 2e-5 \
-	--model_state /path/to/model.pt \
-	--data_dir /path/to/data_dir \
-	--split_slug unbalanced-dev \
-	--normalize \
-	--normalization-stats /path/to/run/normalization_stats.json
+  --experiment_name dragon-transfer \
+  --transfer_learn \
+  --unfreeze-warmup-epochs 3 \
+  --unfreeze-blocks-per-epoch 1 \
+  --lr0 2e-5 \
+  --model_state /tmp/dragon-model-adapted.pt \
+  --data_dir /path/to/dragon_dataset \
+  --run_dir /path/to/dragon_runs \
+  --split_slug stratified
 ```
 
-Transfer learning first trains `fc1`/`fc2` only, then unfreezes complete
+Transfer learning first trains `fc1` and `fc2`, then unfreezes complete
 backbone blocks from `layer8` toward `layer1`. Frozen blocks keep BatchNorm
-parameters and running statistics fixed. With the defaults above, `layer8` is
-unfrozen after epoch 3 and all eight backbone blocks are trainable from epoch
-11 onward. Transfer learning requires fixed asinh normalization. If the JSON
-does not yet exist, it is computed from the transfer-learning training split
-and saved; `--no-normalize` and an omitted `--normalization-stats` are rejected.
+parameters and running statistics fixed. Like training from scratch, transfer
+learning requires the existing dataset-level normalization JSON.
 
 ## Training result reports
 
-Use `scripts/report_training_results.py` to summarize locally stored W&B confusion
-matrices, aggregate metrics, and per-class metrics. It reports the best devel
-step by macro-F1 by default; use `--selection latest` to report the latest
-table for each split instead. Parent-directory scans support both
-`wandb/run-*` and `wandb/offline-run-*` layouts.
-
-For the default macro-F1 selection, the reporter uses the trainer's recorded
-`best_epoch` when available. Legacy accuracy-selected runs are recomputed from
-their stored confusion tables. Every split in a best-step report comes from that
-same step; a missing split is reported as unavailable rather than substituted
-from another epoch. Loss is shown only when W&B summary metadata identifies it
-as belonging to the selected step. The trainer's `best_metrics.json` is used as
-a fallback when it maps uniquely to a run; use `--best-metrics PATH` to supply
-it explicitly for a single run. When a local `run-*.wandb` transaction log is
-present, its history is the authoritative source for table-to-step mappings;
-run the reporter from the project virtual environment so the W&B log reader is
-available.
+The reporter reads each experiment's `best_metrics.json` directly; it does not
+parse W&B run logs. Pass either one experiment directory or a run root whose
+immediate child directories are experiments:
 
 ```bash
-python -m scripts.report_training_results /path/to/dragon_runs
+python -m scripts.report_training_results \
+  /path/to/dragon_runs \
+  --data-dir /path/to/dragon_dataset
+
+python -m scripts.report_training_results \
+  /path/to/dragon_runs/dragon \
+  --data-dir /path/to/dragon_dataset \
+  --split test
 ```
+
+`--data-dir` supplies the dataset-level `labels.csv`. Use `--labels PATH` to
+override it, or omit both options to display numeric class indices. The current
+report schema requires the best epoch, metrics, and train/devel/test confusion
+matrices written by the current trainer.
 
 ## Inference
 
-The inference script runs in a no-labels mode and always applies the fixed
-asinh limits from the training run. Pass the JSON explicitly, or place it at
-`DATA_DIR/normalization_stats.json`. Inference fails instead of falling back to
-per-cutout statistics or unnormalized images.
+Inference products live inside the selected experiment. First prepare one
+catalog's metadata and tensors:
 
 ```bash
-python modules/inference.py \
-	--model-path /path/to/run/models/dragon-unbalanced-dev-XXXXX.pt \
-	--output-dir /path/to/output \
-	--data-dir /path/to/data_dir \
-	--normalization-stats /path/to/run/normalization_stats.json \
-	--cutout-size 94 \
-	--channels 3 \
-	--n-classes 6 \
-	--batch-size 256 \
-	--no_mc_dropout
+python -m data_preprocessing.prepare_inference \
+  --catalog /path/to/catalog.csv \
+  --cutout-dir /path/to/fits_cutouts \
+  --output-dir /path/to/dragon_runs/dragon/inference/catalog-name \
+  --band i --band r --band g \
+  --cutout-size 96
 ```
 
-The command writes `inf_1.csv` with the top two class indices and confidences.
-When `DATA_DIR/labels.csv` is present, it also adds class names and writes
-`summary_counts.csv`. The legacy underscore option names and `--output_path`
-filename prefix remain accepted.
-
-## Heatmaps (Grad-CAM)
+Then run one deterministic prediction pass in the same catalog directory:
 
 ```bash
-python modules/heatmap.py \
-	--model_path /path/to/run/models/dragon-unbalanced-dev-XXXXX.pt \
-	--output_path /path/to/heatmaps/ \
-	--data_dir /path/to/data_dir \
-	--normalization-stats /path/to/run/normalization_stats.json \
-	--cutout_size 94 \
-	--channels 3 \
-	--n_classes 6
+python -m modules.inference \
+  --model-path /path/to/dragon_runs/dragon/model.pt \
+  --output-dir /path/to/dragon_runs/dragon/inference/catalog-name \
+  --data-dir /path/to/dragon_runs/dragon/inference/catalog-name \
+  --normalization-stats /path/to/dragon_dataset/normalization_stats.json \
+  --labels-path /path/to/dragon_dataset/labels.csv \
+  --cutout-size 96 \
+  --channels 3 \
+  --n-classes 6 \
+  --batch-size 256
 ```
 
-Heatmaps are saved as heatmap_00000.png, heatmap_00001.png, and so on.
+Inference requires the dataset-level normalization JSON and only reads its
+stored `vmin`, `vmax`, and `softening`. `labels.csv` is used only to map class
+indices to names. The primary output is `predictions.csv`, containing the top
+two class indices and confidences plus class names when a mapping is supplied.
 
-## Ensemble voting (Congress)
+The compact experiment layout is:
 
-Use modules/congress.py to run inference across a folder of .pt models and aggregate predictions into a single vote per object.
+```text
+dragon_runs/
+  dragon/
+    model.pt
+    best_metrics.json
+    wandb/
+    inference/
+      catalog-name/
+        info.csv
+        tensors/
+          tensors.h5
+        predictions.csv
+        heatmaps/
+          object-id.png
+```
+
+Neither `labels.csv` nor `normalization_stats.json` is copied into the
+experiment or catalog directory.
+
+## Heatmaps (EigenGradCAM)
+
+Heatmaps use exactly the same stored global normalization values as training
+and inference:
 
 ```bash
-python modules/congress.py \
-	--data_dirs /path/to/data_dir \
-	--model_folder models/voters \
-	--n_classes 6 \
-	--channels 1
+python -m modules.heatmap \
+  --model-path /path/to/dragon_runs/dragon/model.pt \
+  --output-dir /path/to/dragon_runs/dragon/inference/catalog-name/heatmaps \
+  --data-dir /path/to/dragon_runs/dragon/inference/catalog-name \
+  --normalization-stats /path/to/dragon_dataset/normalization_stats.json \
+  --cutout-size 96 \
+  --channels 3 \
+  --n-classes 6
 ```
 
-Outputs:
-- combined_results.csv with per-model voter columns
-- congress.csv with voted_class, num_voters, and confidence summaries
-
-## Notebooks and utilities
-
-- modules/inference_notebooks/ includes interactive inference notebooks.
-- modules/FITSViewer.py provides a widget-based FITS viewer for manual curation.
-- modules/simulation/ contains synthetic cutout generation notebooks/scripts.
-- tensorflow/ holds the legacy dual_finder pipeline and visualization tools.
+Each heatmap is saved as `<object_id>.png`; object IDs must be unique and safe
+to use as filenames.

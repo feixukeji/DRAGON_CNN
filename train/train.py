@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
+import re
+import shutil
 
 import click
 import logging
@@ -16,19 +18,14 @@ import kornia.augmentation as K
 from data_preprocessing import (
     FITSDataset,
     get_data_loader,
-    load_or_compute_asinh_stats,
 )
-from cnn import DRAGON, model_stats, save_trained_model
+from cnn import DRAGON, DRAGON_CUTOUT_SIZE, model_stats
 from .create_trainer import create_trainer, create_transfer_learner
 from utils import (
-    DEFAULT_ASINH_SOFTENING,
-    DEFAULT_HIGH_PERCENTILE,
-    DEFAULT_LOW_PERCENTILE,
     build_optimizer,
     discover_devices,
     load_model_state,
-    specify_dropout_rate,
-    validate_transfer_learning_options,
+    normalization_kwargs_from_stats,
 )
 
 
@@ -111,18 +108,23 @@ class RandomDihedralAugmentation(nn.Module):
 @click.command()
 @click.option("--experiment_name", type=str, default="demo")
 @click.option(
-    "--run_id",
-    type=str,
+    "--model_state",
+    type=click.Path(exists=True, dir_okay=False),
     default=None,
-    help="The W&B run ID to resume, if any.",
 )
-@click.option("--model_state", type=click.Path(exists=True), default=None)
-@click.option("--data_dir", type=click.Path(exists=True), required=True)
+@click.option(
+    "--data_dir",
+    type=click.Path(exists=True, file_okay=False),
+    required=True,
+)
 @click.option(
     "--run_dir",
     type=click.Path(),
     default=None,
-    help="Output directory for checkpoints/models (defaults to data_dir).",
+    help=(
+        "Root directory for training runs. Outputs are written below "
+        "RUN_DIR/EXPERIMENT_NAME (default: DATA_DIR/dragon_runs)."
+    ),
 )
 @click.option(
     "--split_slug",
@@ -133,7 +135,7 @@ class RandomDihedralAugmentation(nn.Module):
         "splits/<slug>-devel.csv, and splits/<slug>-test.csv."
     ),
 )
-@click.option("--cutout_size", type=int, default=94)
+@click.option("--cutout_size", type=int, default=96, show_default=True)
 @click.option("--channels", type=int, default=1)
 @click.option("--n_classes", type=int, default=6)
 @click.option(
@@ -150,15 +152,13 @@ class RandomDihedralAugmentation(nn.Module):
     help="Seed model initialization, data shuffling, augmentation, and dropout.",
 )
 @click.option("--batch_size", type=int, default=16)
-@click.option("--epochs", type=int, default=40)
+@click.option("--epochs", type=click.IntRange(min=1), default=40, show_default=True)
 @click.option(
     "--lr0",
-    "--lr",
-    "lr0",
     type=float,
     default=5e-7,
     show_default=True,
-    help="Initial learning rate; --lr is retained as a compatibility alias.",
+    help="Initial learning rate.",
 )
 @click.option("--momentum", type=float, default=0.9)
 @click.option("--weight_decay", type=float, default=0)
@@ -179,28 +179,6 @@ class RandomDihedralAugmentation(nn.Module):
 @click.option("--adamw-beta2", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.999, show_default=True)
 @click.option("--adamw-eps", type=click.FloatRange(min=0.0, min_open=True), default=1e-8, show_default=True)
 @click.option(
-    "--normalize/--no-normalize",
-    default=True,
-    help="Apply percentile clipping followed by a normalized asinh stretch.",
-)
-@click.option("--normalize-low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True)
-@click.option("--normalize-high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True)
-@click.option("--asinh-softening", type=float, default=DEFAULT_ASINH_SOFTENING, show_default=True)
-@click.option(
-    "--normalization-stats",
-    type=click.Path(dir_okay=False),
-    default=None,
-    help=(
-        "Euclid-style JSON containing per-channel vmin/vmax. If the path does "
-        "not exist, statistics are computed from the training split and saved. "
-        "Transfer learning requires this option; regular training falls back "
-        "to per-cutout/channel percentiles when it is omitted."
-    ),
-)
-@click.option("--normalization-sample-per-image", type=int, default=1000, show_default=True)
-@click.option("--normalization-max-samples", type=int, default=2000000, show_default=True)
-@click.option("--normalization-seed", type=int, default=42, show_default=True)
-@click.option(
     "--crop/--no-crop",
     default=True,
     help="""If True, all images are passed through a cropping
@@ -211,21 +189,6 @@ to the cutout_size parameter""",
     "--nesterov/--no-nesterov",
     default=False,
     help="""Whether to use Nesterov momentum or not""",
-)
-@click.option(
-    "--dropout_rate",
-    type=float,
-    default=None,
-    help="""The dropout rate to use for all the layers in the
-    model. If this is set to None, then the default dropout rate
-    in the specific model is used.""",
-)
-@click.option(
-    "--expand_data",
-    type=int,
-    default=1,
-    help="""This controls the factor by which the training
-data is augmented""",
 )
 @click.option(
     "--augment/--no-augment",
@@ -253,8 +216,9 @@ data is augmented""",
     help="Complete layerN backbone blocks to unfreeze after each epoch.",
 )
 @click.option(
-    "--scheduler/--no_scheduler",
-    default=True
+    "--scheduler/--no-scheduler",
+    default=True,
+    show_default=True,
 )
 @click.option(
     "--class_weight",
@@ -271,59 +235,47 @@ def train(**kwargs):
     _seed_training(args["seed"])
     logging.info("Using training seed %d.", args["seed"])
 
-    try:
-        validate_transfer_learning_options(
-            is_training=args["train"],
-            model_state=args["model_state"],
-            normalize=args["normalize"],
-            normalization_stats=args["normalization_stats"],
-        )
-    except ValueError as exc:
-        raise click.UsageError(str(exc)) from exc
-
-    if not 0.0 <= args["normalize_low_pct"] < args["normalize_high_pct"] <= 100.0:
+    if not args["train"] and not args["model_state"]:
+        raise click.UsageError("Transfer learning requires --model_state.")
+    if args["cutout_size"] != DRAGON_CUTOUT_SIZE:
         raise click.BadParameter(
-            "must satisfy 0 <= low < high <= 100",
-            param_hint="--normalize-low-pct/--normalize-high-pct",
-        )
-    if args["asinh_softening"] <= 0:
-        raise click.BadParameter("must be greater than zero", param_hint="--asinh-softening")
-    if args["normalization_sample_per_image"] < 0 or args["normalization_max_samples"] < 0:
-        raise click.BadParameter(
-            "must be non-negative",
-            param_hint="--normalization-sample-per-image/--normalization-max-samples",
+            f"DRAGON requires {DRAGON_CUTOUT_SIZE}x{DRAGON_CUTOUT_SIZE} inputs",
+            param_hint="--cutout_size",
         )
 
-    normalization_kwargs = {
-        "low_pct": args["normalize_low_pct"],
-        "high_pct": args["normalize_high_pct"],
-        "softening": args["asinh_softening"],
-    }
-    if not args["normalize"]:
-        args["normalization_mode"] = "disabled"
-    elif args["normalization_stats"]:
-        args["normalization_mode"] = "global"
-    else:
-        args["normalization_mode"] = "per_cutout"
+    experiment_name = args["experiment_name"].strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", experiment_name):
+        raise click.BadParameter(
+            "must be a single safe slug using letters, digits, '.', '_', or '-'",
+            param_hint="--experiment_name",
+        )
+    args["experiment_name"] = experiment_name
 
     # Discover devices
     args["device"] = discover_devices()
 
-    # Resolve run directory
-    run_dir = Path(args["run_dir"]) if args.get("run_dir") else Path(args["data_dir"])
-    run_dir.mkdir(parents=True, exist_ok=True)
-    args["run_dir"] = str(run_dir)
+    # Resolve the shared run root and this experiment's isolated output directory.
+    run_root = (
+        Path(args["run_dir"])
+        if args.get("run_dir")
+        else Path(args["data_dir"]) / "dragon_runs"
+    )
+    run_root = run_root.expanduser()
+    run_root.mkdir(parents=True, exist_ok=True)
+    run_root = run_root.resolve()
+    experiment_dir = run_root / experiment_name
+    if experiment_dir.parent != run_root:
+        raise click.ClickException(
+            f"Experiment directory escapes the run root: {experiment_dir}"
+        )
+    args["run_dir"] = str(run_root)
+    args["experiment_dir"] = str(experiment_dir)
 
     model_args = {
-        "cutout_size": args["cutout_size"],
         "channels": args["channels"],
         "num_classes": args["n_classes"]
     }
     model = DRAGON(**model_args).to(args["device"])
-
-    # Change the default dropout rate if specified.
-    if args["dropout_rate"] is not None:
-        specify_dropout_rate(model, args["dropout_rate"])
 
     # Load the model from a saved state if provided
     if args["model_state"]:
@@ -368,27 +320,32 @@ def train(**kwargs):
             data_dir=args["data_dir"],
             slug=args["split_slug"],
             split=k,
-            expand_factor=args["expand_data"] if k == "train" else 1,
         )
         for k in splits
     }
 
-    if args["normalize"] and args["normalization_stats"]:
-        stats, computed = load_or_compute_asinh_stats(
-            args["normalization_stats"],
-            datasets["train"],
-            channels=args["channels"],
-            low_pct=args["normalize_low_pct"],
-            high_pct=args["normalize_high_pct"],
-            sample_per_image=args["normalization_sample_per_image"],
-            max_samples_per_channel=args["normalization_max_samples"],
-            seed=args["normalization_seed"],
+    stats_path = Path(args["data_dir"]) / "normalization_stats.json"
+    if not stats_path.is_file():
+        raise click.ClickException(
+            "Training normalization statistics not found: "
+            f"{stats_path}. Generate them before training."
         )
-        action = "Computed and saved" if computed else "Loaded"
-        logging.info(f'{action} normalization stats: {args["normalization_stats"]}')
-        normalization_kwargs.update(vmin=stats["vmin"], vmax=stats["vmax"])
-        args["normalization_vmin"] = stats["vmin"]
-        args["normalization_vmax"] = stats["vmax"]
+    try:
+        normalization_kwargs = normalization_kwargs_from_stats(
+            stats_path,
+            channels=args["channels"],
+        )
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(
+            f"Invalid normalization statistics at {stats_path}: {exc}"
+        ) from exc
+
+    logging.info("Loaded normalization stats: %s", stats_path)
+    args["normalization_stats"] = str(stats_path)
+    args["normalization_mode"] = "global"
+    args["normalization_vmin"] = normalization_kwargs["vmin"]
+    args["normalization_vmax"] = normalization_kwargs["vmax"]
+    args["normalization_softening"] = normalization_kwargs["softening"]
 
     # Keep each split's RNG independent so devel/test iteration cannot consume
     # the training shuffle stream. The generator also supplies reproducible
@@ -418,14 +375,22 @@ def train(**kwargs):
 
     criterion = ClassWeightedCrossEntropyLoss(weight=class_weights)
 
+    # Inputs are now validated and loaded. A same-named experiment is an
+    # explicit overwrite, so remove only the verified RUN_ROOT/EXPERIMENT_NAME
+    # target before W&B or training can create new output files.
+    if experiment_dir.is_symlink() or experiment_dir.is_file():
+        experiment_dir.unlink()
+    elif experiment_dir.is_dir():
+        shutil.rmtree(experiment_dir)
+    experiment_dir.mkdir(parents=True, exist_ok=False)
+
     # Log into W&B
     wandb.login()
 
     # Initializing W&B run
     with wandb.init(
         project=args["experiment_name"],
-        id=args["run_id"],
-        resume="allow",
+        dir=str(experiment_dir),
 
         # track hyperparameters and run metadata
         config={
@@ -451,9 +416,7 @@ def train(**kwargs):
         args = {**args, **model_stats(model)}
         run.log(args)
 
-        # Making an output directory for checkpoints
-        checkpoint_dir = run_dir / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        model_path = experiment_dir / "model.pt"
 
         # Set up trainer
         if args["train"]:
@@ -464,15 +427,13 @@ def train(**kwargs):
                 criterion,
                 loaders,
                 args["device"],
-                args["scheduler"],
+                model_path=model_path,
+                normalization_kwargs=normalization_kwargs,
+                use_scheduler=args["scheduler"],
                 gpu_transforms=train_transforms,
                 eval_gpu_transforms=eval_transforms,
-                normalize=args["normalize"],
-                normalization_kwargs=normalization_kwargs,
-                checkpoint_dir=checkpoint_dir,
-                run_id=run.id,
                 num_epochs=args["epochs"],
-                run_dir=run_dir,
+                run_dir=experiment_dir,
                 max_grad_norm=args["max_grad_norm"],
             )
         else:
@@ -483,35 +444,27 @@ def train(**kwargs):
                 criterion,
                 loaders,
                 args["device"],
-                args["scheduler"],
+                model_path=model_path,
+                normalization_kwargs=normalization_kwargs,
+                use_scheduler=args["scheduler"],
                 gpu_transforms=train_transforms,
                 eval_gpu_transforms=eval_transforms,
-                normalize=args["normalize"],
-                normalization_kwargs=normalization_kwargs,
                 unfreeze_warmup_epochs=args["unfreeze_warmup_epochs"],
                 unfreeze_blocks_per_epoch=args["unfreeze_blocks_per_epoch"],
-                checkpoint_dir=checkpoint_dir,
-                run_id=run.id,
                 num_epochs=args["epochs"],
-                run_dir=run_dir,
+                run_dir=experiment_dir,
                 max_grad_norm=args["max_grad_norm"],
             )
 
-        # Run trainer and save model state
+        # Train and publish the devel macro-F1 best model selected by the trainer.
         trainer.run(loaders["train"], max_epochs=args["epochs"])
-        slug = (
-            f"{args['experiment_name']}-{args['split_slug']}-"
-            f"{run.id}"
-        )
-
-        model_path = save_trained_model(model, slug, output_dir=run_dir / "models")
+        best_model_path = trainer.best_model_path
+        if best_model_path != model_path or not model_path.is_file():
+            raise RuntimeError("Training completed without producing a best model.")
 
         # Log model as an artifact
-        logging.info(f"Saved model to {model_path}")
-        run.log_artifact(model_path)
-
-        # Finish the W&B run!
-        wandb.finish()
+        logging.info(f"Uploading best model from {best_model_path}")
+        run.log_artifact(best_model_path)
 
 
 if __name__ == "__main__":

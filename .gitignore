@@ -1,8 +1,5 @@
-# Data, cnn, and outputs
+# Generated outputs
 /output/
-
-# MLflow files
-mlruns/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -14,6 +11,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 env/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -94,6 +92,11 @@ target/
 
 # WANDB
 wandb/
-scratch_pi_cmu2/
-dragon.egg-info/
-checkpoints/
+
+# Local datasets and generated model/run artifacts
+/data/
+/dragon_runs/
+/artifacts/
+*.pt
+*.pth
+*.ckpt

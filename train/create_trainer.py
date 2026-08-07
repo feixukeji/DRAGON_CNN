@@ -12,7 +12,6 @@ from ignite.engine import (
     create_supervised_evaluator,
 )
 from ignite.metrics import Loss, Accuracy, Precision, ConfusionMatrix, Recall, Fbeta
-from ignite.handlers import ModelCheckpoint
 from ignite.contrib.handlers import ProgressBar
 from ignite.contrib.handlers.param_scheduler import LRScheduler
 import logging
@@ -37,14 +36,6 @@ class GradualBackboneUnfreezer:
             for name, module in backbone_root.named_children()
             if re.fullmatch(r"layer\d+", name)
         ]
-        # The optional ResNet wrapper stores layer1...layer4 under ``model``.
-        if not blocks and hasattr(self.model, "model"):
-            backbone_root = self.model.model
-            blocks = [
-                (name, module)
-                for name, module in backbone_root.named_children()
-                if re.fullmatch(r"layer\d+", name)
-            ]
         if not blocks:
             raise ValueError("Transfer learning requires backbone blocks named layerN.")
 
@@ -113,10 +104,36 @@ def _register_global_grad_norm_clipping(optimizer, max_grad_norm):
     return optimizer.register_step_pre_hook(clip_grad_norm_before_step)
 
 
-def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=True, gpu_transforms=None,
-                   normalize=False, checkpoint_dir=None, run_id=None, num_epochs=32, run_dir=None,
-                   eval_gpu_transforms=None, normalization_kwargs=None, max_grad_norm=1.0):
+def create_trainer(
+    model,
+    optimizer,
+    criterion,
+    loaders,
+    device,
+    *,
+    model_path,
+    normalization_kwargs,
+    use_scheduler=True,
+    gpu_transforms=None,
+    num_epochs=32,
+    run_dir=None,
+    eval_gpu_transforms=None,
+    max_grad_norm=1.0,
+):
     """Set up Ignite trainer with train-only augmentation and deterministic evaluation."""
+
+    if not normalization_kwargs or not {
+        "vmin",
+        "vmax",
+        "softening",
+    }.issubset(normalization_kwargs):
+        raise ValueError(
+            "Training requires fixed vmin/vmax/softening loaded from "
+            "normalization_stats.json."
+        )
+
+    model_path = Path(model_path)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
 
     amp_mode = None
     if torch.device(device).type == "cuda":
@@ -140,9 +157,8 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
             else:
                 x = transforms(x)
 
-        # Apply normalization on the GPU
-        if normalize:
-            x = asinh_normalize(x, **(normalization_kwargs or {}))
+        # Training and evaluation always use the same fixed global statistics.
+        x = asinh_normalize(x, **normalization_kwargs)
 
         return x, y
 
@@ -151,10 +167,6 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
 
     def prepare_eval_batch(batch, device, non_blocking):
         return custom_prepare_batch(batch, device, non_blocking, eval_gpu_transforms)
-
-    # Select checkpoints by macro-F1 so every class contributes equally.
-    def score_function(engine):
-        return engine.state.metrics["f1"]
 
     # 2. Pass the custom function to the trainer
     trainer = create_supervised_trainer(
@@ -201,21 +213,16 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
         amp_mode=amp_mode,
     )
 
-    # Define the checkpoint handler
-    checkpoint_handler = ModelCheckpoint(
-        dirname=checkpoint_dir,
-        filename_prefix=f'best_{run_id}',
-        n_saved=1,
-        require_empty=False,
-        score_function=score_function,
-        score_name="macro_f1",
-        global_step_transform=lambda _engine, _event: trainer.state.epoch,
-    )
-
     pbar_eval = ProgressBar(persist=False, desc="Evaluating")
     pbar_eval.attach(evaluator)
 
-    best_state = {"epoch": None, "score": None, "metrics": {}}
+    best_state = {
+        "epoch": None,
+        "score": None,
+        "metrics": {},
+        "confusion_matrices": {},
+    }
+    trainer.best_model_path = None
 
     # Function to log metrics to wandb
     def log_metrics(trainer, loader, log_prefix=""):
@@ -248,10 +255,6 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
         log_dict[f"{log_prefix}confusion_matrix"] = cm_plot
         wandb.log(log_dict, step=trainer.state.epoch)
 
-        # Only save if this is the validation set
-        if log_prefix == "devel_" and checkpoint_handler is not None:
-            checkpoint_handler(evaluator, to_save={'model': model})
-
         scalar_metrics = {}
         for key, value in metrics.items():
             if key == "cm":
@@ -259,7 +262,7 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
             scalar = _to_float(value)
             if scalar is not None:
                 scalar_metrics[key] = scalar
-        return scalar_metrics
+        return scalar_metrics, cm.astype(int, copy=False).tolist()
 
     def get_current_lr(optimizer):
         return optimizer.param_groups[0]['lr']
@@ -277,33 +280,53 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
     @trainer.on(Events.EPOCH_COMPLETED)
     def log_devel_results(trainer):
         epoch_metrics = {}
+        epoch_confusion_matrices = {}
         for L, loader in loaders.items():
-            epoch_metrics[L] = log_metrics(trainer, loader, log_prefix=f"{L}_")
+            metrics, confusion_matrix = log_metrics(
+                trainer,
+                loader,
+                log_prefix=f"{L}_",
+            )
+            epoch_metrics[L] = metrics
+            epoch_confusion_matrices[L] = confusion_matrix
         wandb.log({"lr": get_current_lr(optimizer)}, step=trainer.state.epoch)
 
         devel_metrics = epoch_metrics.get("devel", {})
         devel_macro_f1 = devel_metrics.get("f1")
-        if devel_macro_f1 is not None:
-            if best_state["score"] is None or devel_macro_f1 > best_state["score"]:
-                best_state["score"] = devel_macro_f1
-                best_state["epoch"] = trainer.state.epoch
-                best_state["metrics"] = {
-                    f"{split}_{key}": value
-                    for split, metrics in epoch_metrics.items()
-                    for key, value in metrics.items()
-                }
+        if devel_macro_f1 is None or not math.isfinite(devel_macro_f1):
+            logging.warning(
+                "Epoch %d produced no finite devel macro-F1; not saving a model.",
+                trainer.state.epoch,
+            )
+            return
+
+        if best_state["score"] is None or devel_macro_f1 > best_state["score"]:
+            torch.save(model.state_dict(), model_path)
+            trainer.best_model_path = model_path
+            best_state["score"] = devel_macro_f1
+            best_state["epoch"] = trainer.state.epoch
+            best_state["metrics"] = {
+                f"{split}_{key}": value
+                for split, metrics in epoch_metrics.items()
+                for key, value in metrics.items()
+            }
+            best_state["confusion_matrices"] = epoch_confusion_matrices
+            logging.info(
+                "Saved epoch %d as the best model (devel macro-F1 %.6f): %s",
+                trainer.state.epoch,
+                devel_macro_f1,
+                model_path,
+            )
 
     @trainer.on(Events.COMPLETED)
-    def log_results_end(trainer):
-        for L, loader in loaders.items():
-            log_metrics(trainer, loader, log_prefix=f"{L}_")
-
+    def save_best_metrics(_trainer):
         if best_state["metrics"]:
             payload = {
                 "best_epoch": best_state["epoch"],
                 "best_devel_macro_f1": best_state["score"],
                 "best_devel_accuracy": best_state["metrics"]["devel_accuracy"],
                 "metrics": best_state["metrics"],
+                "confusion_matrices": best_state["confusion_matrices"],
             }
             if wandb.run is not None:
                 wandb.run.summary["best_epoch"] = best_state["epoch"]
@@ -314,20 +337,17 @@ def create_trainer(model, optimizer, criterion, loaders, device, use_scheduler=T
                 for key, value in best_state["metrics"].items():
                     wandb.run.summary[f"best_{key}"] = value
 
-            target_dir = None
             if run_dir is not None:
                 target_dir = Path(run_dir)
-            elif checkpoint_dir is not None:
-                target_dir = Path(checkpoint_dir)
-
-            if target_dir is not None:
                 target_dir.mkdir(parents=True, exist_ok=True)
                 best_path = target_dir / "best_metrics.json"
                 best_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
                 logging.info(f"Saved best metrics to {best_path}")
-
-        logging.info("Terminating run explicitly.")
-        trainer.terminate()
+        else:
+            raise RuntimeError(
+                "Training completed without a devel macro-F1 result; "
+                "no best model was saved."
+            )
 
     return trainer
 
@@ -338,15 +358,14 @@ def create_transfer_learner(
     criterion,
     loaders,
     device,
+    *,
+    model_path,
+    normalization_kwargs,
     use_scheduler=True,
     gpu_transforms=None,
-    normalize=False,
-    checkpoint_dir=None,
-    run_id=None,
     num_epochs=32,
     run_dir=None,
     eval_gpu_transforms=None,
-    normalization_kwargs=None,
     unfreeze_warmup_epochs=3,
     unfreeze_blocks_per_epoch=1,
     max_grad_norm=1.0,
@@ -371,16 +390,14 @@ def create_transfer_learner(
         criterion,
         loaders,
         device,
-        use_scheduler,
-        gpu_transforms,
-        normalize,
-        checkpoint_dir,
-        run_id,
-        num_epochs,
-        run_dir,
-        eval_gpu_transforms,
-        normalization_kwargs,
-        max_grad_norm,
+        model_path=model_path,
+        normalization_kwargs=normalization_kwargs,
+        use_scheduler=use_scheduler,
+        gpu_transforms=gpu_transforms,
+        num_epochs=num_epochs,
+        run_dir=run_dir,
+        eval_gpu_transforms=eval_gpu_transforms,
+        max_grad_norm=max_grad_norm,
     )
 
     if unfreeze_warmup_epochs == 0:

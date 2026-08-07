@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from utils import load_asinh_stats
+from utils import (
+    DEFAULT_ASINH_SOFTENING,
+    validate_asinh_softening,
+    validate_asinh_stats,
+)
 
 
 def _sample_h5_in_chunk_order(
@@ -20,9 +24,7 @@ def _sample_h5_in_chunk_order(
     """Sample an HDF5-backed dataset while reading each row chunk once."""
     if not getattr(dataset, "use_h5", False):
         return None
-    if getattr(dataset, "transform", None) is not None or getattr(
-        dataset, "normalize", False
-    ):
+    if getattr(dataset, "transform", None) is not None:
         return None
 
     h5_path = getattr(dataset, "h5_path", None)
@@ -140,6 +142,7 @@ def compute_asinh_stats(
     channels,
     low_pct=0.5,
     high_pct=99.5,
+    softening=DEFAULT_ASINH_SOFTENING,
     sample_per_image=1000,
     max_samples_per_channel=2_000_000,
     seed=42,
@@ -155,10 +158,11 @@ def compute_asinh_stats(
         raise ValueError("Percentiles must satisfy 0 <= low_pct < high_pct <= 100.")
     if channels <= 0:
         raise ValueError("channels must be greater than zero.")
+    softening = validate_asinh_softening(softening)
     if sample_per_image < 0 or max_samples_per_channel < 0:
         raise ValueError("Sampling limits must be non-negative.")
 
-    # Avoid counting expand_factor replicas when the dataset exposes base labels.
+    # Prefer the dataset's base row count when it exposes aligned labels.
     num_images = len(dataset.labels) if hasattr(dataset, "labels") else len(dataset)
     if num_images == 0:
         raise ValueError("No pixels were found in the requested dataset split.")
@@ -235,6 +239,7 @@ def compute_asinh_stats(
     return {
         "low_pct": low_pct,
         "high_pct": high_pct,
+        "softening": softening,
         "vmin": vmin,
         "vmax": vmax,
         "num_images": num_images,
@@ -246,21 +251,12 @@ def compute_asinh_stats(
 
 
 def save_asinh_stats(stats, path):
-    """Write normalization statistics as Euclid-compatible JSON."""
+    """Validate and write fixed asinh normalization statistics."""
+    validated_stats = validate_asinh_stats(stats)
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(stats, indent=2, sort_keys=True), encoding="utf-8"
+        json.dumps(validated_stats, allow_nan=False, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     return output_path
-
-
-def load_or_compute_asinh_stats(path, dataset, channels, **compute_kwargs):
-    """Load an existing stats JSON or compute and persist it from a split."""
-    stats_path = Path(path)
-    if stats_path.is_file():
-        return load_asinh_stats(stats_path, channels=channels), False
-
-    stats = compute_asinh_stats(dataset, channels=channels, **compute_kwargs)
-    save_asinh_stats(stats, stats_path)
-    return stats, True

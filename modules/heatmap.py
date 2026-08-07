@@ -14,23 +14,19 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 
 import kornia.augmentation as K
 
-from cnn import model_factory
+from cnn import DRAGON, DRAGON_CUTOUT_SIZE
 from modules.batched_eigen_grad_cam import BatchedEigenGradCAM
 from utils import (
-    DEFAULT_ASINH_SOFTENING,
-    DEFAULT_HIGH_PERCENTILE,
-    DEFAULT_LOW_PERCENTILE,
     asinh_normalize,
     discover_devices,
-    enable_dropout,
-    load_asinh_stats,
-    specify_dropout_rate,
+    load_model_state,
+    normalization_kwargs_from_stats,
 )
 
 import cv2
 
 
-def _object_id_output_paths(dataset, output_path):
+def _object_id_output_paths(dataset, output_dir):
     """Return one validated ``<object_id>.png`` path per dataset row."""
     if not hasattr(dataset, "data_info"):
         raise ValueError("Dataset does not expose the metadata needed for object_id filenames.")
@@ -73,7 +69,7 @@ def _object_id_output_paths(dataset, output_path):
             f"contains {len(dataset)} samples."
         )
 
-    output_dir = Path(output_path)
+    output_dir = Path(output_dir)
     return [output_dir / f"{object_id}.png" for object_id in names]
 
 
@@ -128,20 +124,14 @@ def _save_heatmap_batch(
 
 def heatmap(
         model_path,
-        output_path,
+        output_dir,
         dataset,
-        cutout_size,
         channels,
         parallel=False,
         batch_size=256,
         n_workers=1,
         output_workers=4,
         num_classes=6,
-        model_type="dragon",
-        mc_dropout=False,
-        dropout_rate=None,
-        apply_softmax=True,
-        normalize=False,
         normalization_kwargs=None,
 ):
     """Using the model defined in model path, return the output values for
@@ -149,47 +139,34 @@ def heatmap(
 
     if output_workers < 1:
         raise ValueError("output_workers must be at least 1.")
+    if not normalization_kwargs or not {
+        "vmin",
+        "vmax",
+        "softening",
+    }.issubset(normalization_kwargs):
+        raise ValueError(
+            "Heatmap generation requires vmin/vmax/softening loaded from "
+            "normalization_stats.json"
+        )
 
     # Discover devices
     device = discover_devices()
 
-    # Declare the model given model_type
-    cls = model_factory(model_type)
     model_args = {
-        "cutout_size": cutout_size,
         "channels": channels,
         "num_classes": num_classes
     }
-
-    if "drp" in model_type.split("_"):
-        logging.info(
-            "Using dropout rate of {} in the model".format(dropout_rate)
-        )
-        model_args["dropout"] = "True"
-
-    model = cls(**model_args)
+    model = DRAGON(**model_args)
 
     # Load the model
     logging.info("Loading model...")
-    if device == "cpu":
-        model.load_state_dict(torch.load(model_path, map_location="cpu"))
-    else:
-        model.load_state_dict(torch.load(model_path))
-
-
-    model = nn.DataParallel(model) if parallel else model
+    load_model_state(model, model_path, device=device)
+    if parallel and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     model = model.to(device)
-
-    # Changing the dropout rate if specified
-    if dropout_rate is not None:
-        specify_dropout_rate(model, dropout_rate)
 
     # Set to evaluation mode
     model.eval()
-
-    # If using Monte Carlo dropout, re-enable dropout layers
-    if mc_dropout:
-        enable_dropout(model)
 
     # Create a data_preprocessing loader
     loader = get_data_loader(
@@ -200,10 +177,12 @@ def heatmap(
     )
 
     # Acquiring GradCAM layer
-    target_layer = model.module.layer4 if parallel else model.layer4
+    target_layer = model.module.layer4 if isinstance(model, nn.DataParallel) else model.layer4
 
-    output_dir = Path(output_path)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    for stale_heatmap in output_dir.glob("*.png"):
+        stale_heatmap.unlink()
     output_paths = _object_id_output_paths(dataset, output_dir)
     global_img_idx = 0
     logging.info("Performing heatmap creation...")
@@ -220,8 +199,7 @@ def heatmap(
             X = X.to(device, non_blocking=True)
             if dataset.transform is not None:
                 X = dataset.transform(X)
-            if normalize:
-                X = asinh_normalize(X, **(normalization_kwargs or {}))
+            X = asinh_normalize(X, **normalization_kwargs)
 
             grayscale_cam = cam(input_tensor=X)
 
@@ -250,52 +228,34 @@ def heatmap(
 
 @click.command()
 @click.option(
-    "--model_type",
-    type=click.Choice(
-        [
-            "dragon"
-        ],
-        case_sensitive=False,
-    ),
-    default="dragon",
-)
-@click.option("--model_path", type=click.Path(exists=True), required=True)
-@click.option("--output_path", type=click.Path(writable=True), required=True)
-@click.option("--data_dir", type=click.Path(exists=True), required=True)
-@click.option("--cutout_size", type=int, default=167)
-@click.option("--channels", type=int, default=3)
-@click.option(
-    "--slug",
-    type=str,
+    "--model-path",
+    type=click.Path(exists=True, dir_okay=False),
     required=True,
-    help="""This specifies which slug (balanced/unbalanced
-              xs, sm, lg, dev) is used to perform predictions on.""",
 )
-@click.option("--split", type=str, required=True, default="test")
+@click.option("--output-dir", type=click.Path(file_okay=False), required=True)
 @click.option(
-    "--normalize/--no-normalize",
-    default=True,
-    help="Apply percentile clipping followed by a normalized asinh stretch.",
+    "--data-dir",
+    type=click.Path(exists=True, file_okay=False),
+    required=True,
 )
-@click.option("--normalize-low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True)
-@click.option("--normalize-high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True)
-@click.option("--asinh-softening", type=float, default=DEFAULT_ASINH_SOFTENING, show_default=True)
+@click.option("--cutout-size", type=int, default=96, show_default=True)
+@click.option("--channels", type=int, default=3)
 @click.option(
     "--normalization-stats",
     type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="JSON with the same per-channel vmin/vmax used during training.",
+    required=True,
+    help="Dataset-level JSON containing training vmin/vmax and softening.",
 )
-@click.option("--batch_size", type=int, default=256)
+@click.option("--batch-size", type=int, default=256)
 @click.option(
-    "--n_workers",
+    "--n-workers",
     type=int,
     default=4,
     help="""The number of workers to be used during the
               data_preprocessing loading process.""",
 )
 @click.option(
-    "--output_workers",
+    "--output-workers",
     type=click.IntRange(min=1),
     default=4,
     show_default=True,
@@ -307,156 +267,68 @@ def heatmap(
     help="""The parallel argument controls whether or not
               to use multiple GPUs when they are available""",
 )
+@click.option("--n-classes", type=int, default=6)
 @click.option(
-    "--label_col",
-    type=str,
-    default="classes",
-    help="""Enter the label column(s) separated by commas. Note
-    that you should pass the exactly same argument for label_col
-    as was used during the training phase (of the model being used
-    for inference). """,
-)
-@click.option(
-    "--mc_dropout/--no-mc_dropout",
-    default=True,
-    help="""Turn on Monte Carlo dropout during inference.""",
-)
-@click.option(
-    "--n_runs",
-    type=int,
-    default=1,
-    help="""The number of times to run inference. This is helpful
-    when usng mc_dropout""",
-)
-@click.option("--n_classes", type=int, default=6)
-@click.option(
-    "--ini_run_num",
-    type=int,
-    default=1,
-    help="""The number of the first run. i.e. the output csv files
-    are named as (inf_run_num+iteration_number).csv""",
-)
-@click.option(
-    "--dropout_rate",
-    type=float,
-    default=None,
-    help="""The dropout rate to use for all the layers in the
-    model. If this is set to None, then the default dropout rate
-    in the specific model is used. This option should only be
-    used when you have used a non-default dropout rate during
-    training and have set --mc_dropout to True. The rate should
-    be set equal to the rate used during training.""",
-)
-@click.option(
-    "--crop /--no-crop",
+    "--crop/--no-crop",
     default=True,
     help="""If True, the images are passed through a cropping transformation
 to ensure proper cutout size""",
 )
-@click.option(
-    "--labels/--no-labels",
-    default=True,
-    help="""If True, this means you have labels available for the dataset.
-    If False, this means that you have no labels available and want to do
-    pure inference using a pre-trained model.""",
-)
 def main(
     model_path,
-    output_path,
+    output_dir,
     data_dir,
     cutout_size,
     channels,
     parallel,
-    slug,
-    split,
-    normalize,
-    normalize_low_pct,
-    normalize_high_pct,
-    asinh_softening,
     normalization_stats,
     batch_size,
     n_workers,
     output_workers,
-    label_col,
-    model_type,
-    mc_dropout,
-    dropout_rate,
     crop,
-    n_runs,
     n_classes,
-    ini_run_num,
-    labels,
 ):
 
-    if not 0.0 <= normalize_low_pct < normalize_high_pct <= 100.0:
+    if cutout_size != DRAGON_CUTOUT_SIZE:
         raise click.BadParameter(
-            "must satisfy 0 <= low < high <= 100",
-            param_hint="--normalize-low-pct/--normalize-high-pct",
+            f"DRAGON requires {DRAGON_CUTOUT_SIZE}x{DRAGON_CUTOUT_SIZE} inputs",
+            param_hint="--cutout-size",
         )
-    if asinh_softening <= 0:
-        raise click.BadParameter("must be greater than zero", param_hint="--asinh-softening")
 
-    normalization_kwargs = {
-        "low_pct": normalize_low_pct,
-        "high_pct": normalize_high_pct,
-        "softening": asinh_softening,
-    }
-    if normalization_stats:
-        stats = load_asinh_stats(normalization_stats, channels=channels)
-        normalization_kwargs.update(vmin=stats["vmin"], vmax=stats["vmax"])
-
-    logging.info(
-        """Creating full heatmaps. Using
-            column names to infer number of expected outputs.
-            Split and Slug values entered will be ignored and
-            info.csv will be used."""
-    )
-    split = None
-    slug = None
-
-    # Create label cols array
-    label_col_arr = label_col.split(",")
+    stats_path = Path(normalization_stats)
+    try:
+        normalization_kwargs = normalization_kwargs_from_stats(
+            stats_path,
+            channels=channels,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     # Transforming the dataset to the proper cutout size
     T = None
     if crop:
         T = K.CenterCrop(cutout_size)
 
-    # Test
-
-    # Load the data_preprocessing and create a data_preprocessing loader
+    # Load the data and create a loader.
     logging.info("Loading images to device...")
     dataset = FITSDataset(
         data_dir,
-        slug=slug,
-        split=split,
-        label_col=label_col_arr,
         transforms=T,
         load_labels=False
     )
 
-    for run_num in range(ini_run_num, n_runs + ini_run_num):
-
-        logging.info(f"Running heatmap run {run_num}")
-
-        # Make predictions
-        heatmap(
-            model_path,
-            output_path,
-            dataset,
-            cutout_size,
-            channels,
-            parallel=parallel,
-            batch_size=batch_size,
-            n_workers=n_workers,
-            output_workers=output_workers,
-            num_classes=n_classes,
-            model_type=model_type,
-            mc_dropout=mc_dropout,
-            dropout_rate=dropout_rate,
-            normalize=normalize,
-            normalization_kwargs=normalization_kwargs,
-        )
+    heatmap(
+        model_path,
+        output_dir,
+        dataset,
+        channels,
+        parallel=parallel,
+        batch_size=batch_size,
+        n_workers=n_workers,
+        output_workers=output_workers,
+        num_classes=n_classes,
+        normalization_kwargs=normalization_kwargs,
+    )
 
 
 

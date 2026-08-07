@@ -1,103 +1,51 @@
-"""Prepare a catalog and HDF5 tensors for label-free DRAGON inference."""
+"""Prepare a compact catalog and HDF5 store for DRAGON inference."""
 
 from __future__ import annotations
 
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
+import tempfile
 
 import click
 import pandas as pd
 
-from data_preprocessing import create_cutout_tensors
-from utils import label_mapping_frame, load_asinh_stats, load_label_mapping
+from data_preprocessing.create_cutouts import create_cutout_tensors
 
 
 @dataclass(frozen=True)
 class PreparedInferenceData:
-    run_dir: Path
-    raw_info_path: Path
+    output_dir: Path
     info_path: Path
-    labels_path: Path
-    normalization_stats_path: Path
     h5_path: Path
     rows: int
-
-
-def _resolve_file(path: Path | str, description: str) -> Path:
-    resolved = Path(path).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"{description} not found: {resolved}")
-    return resolved
-
-
-def resolve_model_artifact(
-    model_path: Path | str,
-    filename: str,
-    explicit_path: Path | str | None = None,
-) -> Path:
-    """Resolve a run artifact beside a model or in its parent run directory."""
-    if explicit_path is not None:
-        return _resolve_file(explicit_path, filename)
-
-    model = _resolve_file(model_path, "Model")
-    candidates = [model.parent / filename, model.parent.parent / filename]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    searched = ", ".join(str(candidate) for candidate in candidates)
-    raise FileNotFoundError(f"Unable to find {filename}; searched: {searched}")
-
-
-def _copy_file(source: Path, destination: Path) -> None:
-    if source.resolve() == destination.resolve():
-        return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
 
 
 def prepare_inference_data(
     *,
     catalog_path: Path | str,
     cutout_dir: Path | str,
-    run_dir: Path | str,
-    model_path: Path | str,
+    output_dir: Path | str,
     bands: tuple[str, ...] | list[str],
     cutout_size: int,
-    channels: int,
     workers: int,
-    labels_path: Path | str | None = None,
-    normalization_stats_path: Path | str | None = None,
-    copy_artifacts: bool = True,
 ) -> PreparedInferenceData:
-    """Build inference metadata and recreate tensors for every run."""
-    catalog = _resolve_file(catalog_path, "Catalog")
+    """Build ``info.csv`` and recreate tensors for one inference catalog."""
+    catalog = Path(catalog_path).expanduser().resolve()
     cutouts = Path(cutout_dir).expanduser().resolve()
-    output = Path(run_dir).expanduser().resolve()
-    model = _resolve_file(model_path, "Model")
+    output = Path(output_dir).expanduser().resolve()
     normalized_bands = tuple(dict.fromkeys(str(band).strip() for band in bands))
 
+    if not catalog.is_file():
+        raise FileNotFoundError(f"Catalog not found: {catalog}")
     if not cutouts.is_dir():
         raise FileNotFoundError(f"Cutout directory not found: {cutouts}")
     if not normalized_bands or any(not band for band in normalized_bands):
         raise ValueError("At least one non-empty band is required")
-    if channels != len(normalized_bands):
-        raise ValueError(
-            f"channels={channels} does not match {len(normalized_bands)} bands"
-        )
     if cutout_size <= 0:
         raise ValueError("cutout_size must be positive")
     if workers <= 0:
         raise ValueError("workers must be positive")
-
-    source_labels = resolve_model_artifact(model, "labels.csv", labels_path)
-    source_stats = resolve_model_artifact(
-        model,
-        "normalization_stats.json",
-        normalization_stats_path,
-    )
-    label_mapping = load_label_mapping(source_labels)
-    load_asinh_stats(source_stats, channels=channels)
 
     info = pd.read_csv(catalog, dtype={"object_id": str})
     if "object_id" not in info.columns:
@@ -114,43 +62,46 @@ def prepare_inference_data(
         ]
 
     output.mkdir(parents=True, exist_ok=True)
-    raw_info_path = output / "raw_info.csv"
-    info.to_csv(raw_info_path, index=False)
-
-    if copy_artifacts:
-        destination_labels = output / "labels.csv"
-        label_mapping_frame(label_mapping).to_csv(destination_labels, index=False)
-        destination_stats = output / "normalization_stats.json"
-        _copy_file(source_stats, destination_stats)
-    else:
-        destination_labels = source_labels
-        destination_stats = source_stats
+    for stale_file in (
+        "raw_info.csv",
+        "predictions.csv",
+        "summary_counts.csv",
+        "labels.csv",
+        "normalization_stats.json",
+    ):
+        (output / stale_file).unlink(missing_ok=True)
+    for stale_dir in ("predictions", "heatmaps"):
+        stale_path = output / stale_dir
+        if stale_path.is_symlink():
+            stale_path.unlink()
+        elif stale_path.is_dir():
+            shutil.rmtree(stale_path)
 
     tensors_dir = output / "tensors"
     h5_path = tensors_dir / "tensors.h5"
     clean_info_path = tensors_dir / "clean_info.csv"
-    create_cutout_tensors(
-        data_dir=output,
-        csv_path=raw_info_path,
-        out_dir=tensors_dir,
-        bands=normalized_bands,
-        cutout_size=cutout_size,
-        workers=workers,
-        use_gpu=False,
-    )
+    with tempfile.TemporaryDirectory(prefix=".prepare-", dir=output) as temp_dir:
+        raw_info_path = Path(temp_dir) / "raw_info.csv"
+        info.to_csv(raw_info_path, index=False)
+        create_cutout_tensors(
+            data_dir=output,
+            csv_path=raw_info_path,
+            out_dir=tensors_dir,
+            bands=normalized_bands,
+            cutout_size=cutout_size,
+            workers=workers,
+        )
 
     clean_info = pd.read_csv(clean_info_path, dtype={"object_id": str})
     if clean_info.empty:
         raise ValueError("No readable FITS cutouts remain after preprocessing")
     info_path = output / "info.csv"
     clean_info.to_csv(info_path, index=False)
+    clean_info_path.unlink()
 
     return PreparedInferenceData(
-        run_dir=output,
-        raw_info_path=raw_info_path,
+        output_dir=output,
         info_path=info_path,
-        labels_path=destination_labels,
-        normalization_stats_path=destination_stats,
         h5_path=h5_path,
         rows=len(clean_info),
     )
@@ -164,19 +115,10 @@ def prepare_inference_data(
     required=True,
 )
 @click.option("--cutout-dir", type=click.Path(file_okay=False), required=True)
-@click.option("--run-dir", type=click.Path(file_okay=False), required=True)
-@click.option("--model-path", type=click.Path(exists=True, dir_okay=False), required=True)
+@click.option("--output-dir", type=click.Path(file_okay=False), required=True)
 @click.option("--band", "bands", multiple=True, required=True)
-@click.option("--cutout-size", type=int, default=94, show_default=True)
-@click.option("--channels", type=int, required=True)
+@click.option("--cutout-size", type=int, default=96, show_default=True)
 @click.option("--workers", type=int, default=4, show_default=True)
-@click.option("--labels", "labels_path", type=click.Path(exists=True, dir_okay=False))
-@click.option(
-    "--normalization-stats",
-    "normalization_stats_path",
-    type=click.Path(exists=True, dir_okay=False),
-)
-@click.option("--copy-artifacts/--no-copy-artifacts", default=True)
 def main(**kwargs) -> None:
     """Prepare metadata and tensors for DRAGON inference."""
     try:
@@ -184,9 +126,8 @@ def main(**kwargs) -> None:
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Prepared {prepared.rows} inference rows in {prepared.run_dir}")
+    click.echo(f"Prepared {prepared.rows} inference rows in {prepared.output_dir}")
     click.echo(f"Rebuilt inference tensors: {prepared.h5_path}")
-    click.echo(f"Normalization stats: {prepared.normalization_stats_path}")
 
 
 if __name__ == "__main__":
