@@ -140,7 +140,8 @@ are not supported. The following example trains a six-class, three-channel,
 
 ```bash
 python -m train.train \
-  --experiment_name dragon \
+  --project dragon \
+  --experiment seed42 \
   --data_dir /path/to/dragon_dataset \
   --run_dir /path/to/dragon_runs \
   --split_slug stratified \
@@ -157,12 +158,13 @@ already exist. It always applies global asinh normalization using the JSON's
 per-channel limits and softening; it never computes statistics or accepts a
 separate softening value.
 
-`--run_dir` is the shared run root. Each `--experiment_name` owns exactly one
-experiment directory:
+`--project` selects the W&B cloud project, while `--experiment` names the W&B
+run and its local output directory. `--run_dir` is the shared run root. Each
+experiment owns exactly one directory:
 
 ```text
 dragon_runs/
-  dragon/
+  seed42/
     model.pt
     best_metrics.json
     wandb/
@@ -216,7 +218,8 @@ matching classifier weights are reinitialized for that output size.
 
 ```bash
 python -m train.train \
-  --experiment_name dragon-transfer \
+  --project dragon-transfer \
+  --experiment seed42 \
   --transfer_learn \
   --unfreeze-warmup-epochs 3 \
   --unfreeze-blocks-per-epoch 1 \
@@ -244,7 +247,7 @@ python -m scripts.report_training_results \
   --data-dir /path/to/dragon_dataset
 
 python -m scripts.report_training_results \
-  /path/to/dragon_runs/dragon \
+  /path/to/dragon_runs/seed42 \
   --data-dir /path/to/dragon_dataset \
   --split test
 ```
@@ -263,7 +266,7 @@ catalog's metadata and tensors:
 python -m data_preprocessing.prepare_inference \
   --catalog /path/to/catalog.csv \
   --cutout-dir /path/to/fits_cutouts \
-  --output-dir /path/to/dragon_runs/dragon/inference/catalog-name \
+  --output-dir /path/to/dragon_runs/seed42/inference/catalog-name \
   --band i --band r --band g \
   --cutout-size 96
 ```
@@ -272,9 +275,9 @@ Then run one deterministic prediction pass in the same catalog directory:
 
 ```bash
 python -m modules.inference \
-  --model-path /path/to/dragon_runs/dragon/model.pt \
-  --output-dir /path/to/dragon_runs/dragon/inference/catalog-name \
-  --data-dir /path/to/dragon_runs/dragon/inference/catalog-name \
+  --model-path /path/to/dragon_runs/seed42/model.pt \
+  --output-dir /path/to/dragon_runs/seed42/inference/catalog-name \
+  --data-dir /path/to/dragon_runs/seed42/inference/catalog-name \
   --normalization-stats /path/to/dragon_dataset/normalization_stats.json \
   --labels-path /path/to/dragon_dataset/labels.csv \
   --cutout-size 96 \
@@ -292,7 +295,7 @@ The compact experiment layout is:
 
 ```text
 dragon_runs/
-  dragon/
+  seed42/
     model.pt
     best_metrics.json
     wandb/
@@ -316,9 +319,9 @@ and inference:
 
 ```bash
 python -m modules.heatmap \
-  --model-path /path/to/dragon_runs/dragon/model.pt \
-  --output-dir /path/to/dragon_runs/dragon/inference/catalog-name/heatmaps \
-  --data-dir /path/to/dragon_runs/dragon/inference/catalog-name \
+  --model-path /path/to/dragon_runs/seed42/model.pt \
+  --output-dir /path/to/dragon_runs/seed42/inference/catalog-name/heatmaps \
+  --data-dir /path/to/dragon_runs/seed42/inference/catalog-name \
   --normalization-stats /path/to/dragon_dataset/normalization_stats.json \
   --cutout-size 96 \
   --channels 3 \

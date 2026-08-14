@@ -106,7 +106,20 @@ class RandomDihedralAugmentation(nn.Module):
 
 
 @click.command()
-@click.option("--experiment_name", type=str, default="demo")
+@click.option(
+    "--project",
+    type=str,
+    default="dragon",
+    show_default=True,
+    help="W&B project name.",
+)
+@click.option(
+    "--experiment",
+    type=str,
+    default="demo",
+    show_default=True,
+    help="Experiment name used for the W&B run and local output directory.",
+)
 @click.option(
     "--model_state",
     type=click.Path(exists=True, dir_okay=False),
@@ -123,7 +136,7 @@ class RandomDihedralAugmentation(nn.Module):
     default=None,
     help=(
         "Root directory for training runs. Outputs are written below "
-        "RUN_DIR/EXPERIMENT_NAME (default: DATA_DIR/dragon_runs)."
+        "RUN_DIR/EXPERIMENT (default: DATA_DIR/dragon_runs)."
     ),
 )
 @click.option(
@@ -243,13 +256,14 @@ def train(**kwargs):
             param_hint="--cutout_size",
         )
 
-    experiment_name = args["experiment_name"].strip()
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", experiment_name):
-        raise click.BadParameter(
-            "must be a single safe slug using letters, digits, '.', '_', or '-'",
-            param_hint="--experiment_name",
-        )
-    args["experiment_name"] = experiment_name
+    for parameter in ("project", "experiment"):
+        value = args[parameter].strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+            raise click.BadParameter(
+                "must be a single safe slug using letters, digits, '.', '_', or '-'",
+                param_hint=f"--{parameter}",
+            )
+        args[parameter] = value
 
     # Discover devices
     args["device"] = discover_devices()
@@ -263,7 +277,7 @@ def train(**kwargs):
     run_root = run_root.expanduser()
     run_root.mkdir(parents=True, exist_ok=True)
     run_root = run_root.resolve()
-    experiment_dir = run_root / experiment_name
+    experiment_dir = run_root / args["experiment"]
     if experiment_dir.parent != run_root:
         raise click.ClickException(
             f"Experiment directory escapes the run root: {experiment_dir}"
@@ -376,7 +390,7 @@ def train(**kwargs):
     criterion = ClassWeightedCrossEntropyLoss(weight=class_weights)
 
     # Inputs are now validated and loaded. A same-named experiment is an
-    # explicit overwrite, so remove only the verified RUN_ROOT/EXPERIMENT_NAME
+    # explicit overwrite, so remove only the verified RUN_ROOT/EXPERIMENT
     # target before W&B or training can create new output files.
     if experiment_dir.is_symlink() or experiment_dir.is_file():
         experiment_dir.unlink()
@@ -389,7 +403,8 @@ def train(**kwargs):
 
     # Initializing W&B run
     with wandb.init(
-        project=args["experiment_name"],
+        project=args["project"],
+        name=args["experiment"],
         dir=str(experiment_dir),
 
         # track hyperparameters and run metadata
