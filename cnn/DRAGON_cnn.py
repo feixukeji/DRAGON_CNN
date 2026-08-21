@@ -58,6 +58,7 @@ class DRAGON(nn.Module):
         )
 
         self.fc1 = nn.Linear(2048, 1024)
+        self.fc_activation = nn.LeakyReLU()
         self.drop = nn.Dropout(0.5)
         self.fc2 = nn.Linear(1024, num_classes)
 
@@ -77,6 +78,7 @@ class DRAGON(nn.Module):
 
         # Fully connected layers
         out = self.fc1(out)
+        out = self.fc_activation(out)
         out = self.drop(out)
         out = self.fc2(out)
 
