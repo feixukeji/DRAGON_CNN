@@ -18,7 +18,27 @@ import logging
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from utils import asinh_normalize
+from utils import load_model_state
+
+
+WANDB_METRIC_NAMES = {
+    "accuracy": "accuracy",
+    "precision": "precision_weighted",
+    "recall": "recall_weighted",
+    "loss": "loss",
+    "f1": "f1_macro",
+}
+
+
+def _configure_wandb_metrics(wandb_run):
+    """Use epoch only for metrics that genuinely form an epoch series."""
+    wandb_run.define_metric("epoch")
+    for namespace in ("train", "devel", "optimizer", "transfer"):
+        wandb_run.define_metric(
+            f"{namespace}/*",
+            step_metric="epoch",
+            summary="none",
+        )
 
 
 class GradualBackboneUnfreezer:
@@ -112,7 +132,8 @@ def create_trainer(
     device,
     *,
     model_path,
-    normalization_kwargs,
+    num_classes,
+    wandb_run,
     use_scheduler=True,
     gpu_transforms=None,
     num_epochs=32,
@@ -122,18 +143,9 @@ def create_trainer(
 ):
     """Set up Ignite trainer with train-only augmentation and deterministic evaluation."""
 
-    if not normalization_kwargs or not {
-        "vmin",
-        "vmax",
-        "softening",
-    }.issubset(normalization_kwargs):
-        raise ValueError(
-            "Training requires fixed vmin/vmax/softening loaded from "
-            "normalization_stats.json."
-        )
-
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
+    _configure_wandb_metrics(wandb_run)
 
     amp_mode = None
     if torch.device(device).type == "cuda":
@@ -145,7 +157,7 @@ def create_trainer(
     def custom_prepare_batch(batch, device, non_blocking, transforms):
         x, y = batch
 
-        # Move the raw batch to the GPU first
+        # Images were normalized once during the full HDF5 preload.
         x = x.to(device, non_blocking=non_blocking)
         y = y.to(device, non_blocking=non_blocking)
 
@@ -156,9 +168,6 @@ def create_trainer(
                     x = transform(x)
             else:
                 x = transforms(x)
-
-        # Training and evaluation always use the same fixed global statistics.
-        x = asinh_normalize(x, **normalization_kwargs)
 
         return x, y
 
@@ -203,8 +212,11 @@ def create_trainer(
         "precision": Precision(average="weighted"),
         "recall": Recall(average="weighted"),
         "loss": Loss(criterion),
-        "cm": ConfusionMatrix(num_classes=wandb.config["num_classes"], output_transform=lambda x: x),
-        "f1": Fbeta(beta=1, average=True)
+        "cm": ConfusionMatrix(
+            num_classes=num_classes,
+            output_transform=lambda x: x,
+        ),
+        "f1": Fbeta(beta=1, average=True),
     }
 
     evaluator = create_supervised_evaluator(
@@ -224,36 +236,31 @@ def create_trainer(
     }
     trainer.best_model_path = None
 
-    # Function to log metrics to wandb
-    def log_metrics(trainer, loader, log_prefix=""):
-        logging.info(f"Logging metrics for {log_prefix}")
+    class_names = [str(index) for index in range(num_classes)]
+
+    def confusion_matrix_plot(confusion_matrix):
+        """Build a W&B confusion-matrix chart from aggregated counts."""
+        y_true, y_pred = [], []
+        for true_class, row in enumerate(confusion_matrix):
+            for predicted_class, count in enumerate(row):
+                y_true.extend([true_class] * int(count))
+                y_pred.extend([predicted_class] * int(count))
+        return wandb.plot.confusion_matrix(
+            probs=None,
+            y_true=y_true,
+            preds=y_pred,
+            class_names=class_names,
+        )
+
+    def evaluate_metrics(loader, split):
+        logging.info("Evaluating %s metrics.", split)
 
         # Reset evaluator state before running evaluation
         evaluator.state.metrics = {}
 
         evaluator.run(loader)
         metrics = evaluator.state.metrics
-        log_dict = {f"{log_prefix}{k}": v for k, v in metrics.items() if k != "cm"}
-
-        # Handle the confusion matrix separately
         cm = metrics["cm"].cpu().numpy()
-        class_names = [str(i) for i in range(wandb.config["num_classes"])]
-
-        # Calculate true and predicted labels from the confusion matrix
-        y_true, y_pred = [], []
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                y_true.extend([i] * int(cm[i, j]))
-                y_pred.extend([j] * int(cm[i, j]))
-
-        cm_plot = wandb.plot.confusion_matrix(probs=None,
-                                              y_true=y_true,
-                                              preds=y_pred,
-                                              class_names=class_names)
-
-        # Log other metrics and the confusion matrix plot
-        log_dict[f"{log_prefix}confusion_matrix"] = cm_plot
-        wandb.log(log_dict, step=trainer.state.epoch)
 
         scalar_metrics = {}
         for key, value in metrics.items():
@@ -271,27 +278,63 @@ def create_trainer(
     if use_scheduler:
         trainer.add_event_handler(Events.ITERATION_STARTED, scheduler)
 
-    @trainer.on(Events.STARTED)
-    def log_results_start(trainer):
-        logging.info("Log results started.")
-        for L, loader in loaders.items():
-            log_metrics(trainer, loader, log_prefix=f"{L}_")
+    epoch_train_loss = {
+        "weighted_sum": 0.0,
+        "samples": 0,
+        "mean": None,
+    }
+
+    @trainer.on(Events.EPOCH_STARTED)
+    def reset_epoch_train_loss(_trainer):
+        epoch_train_loss["weighted_sum"] = 0.0
+        epoch_train_loss["samples"] = 0
+        epoch_train_loss["mean"] = None
+
+    @trainer.on(Events.ITERATION_COMPLETED)
+    def accumulate_epoch_train_loss(trainer):
+        batch_loss = _to_float(trainer.state.output)
+        if batch_loss is None or not math.isfinite(batch_loss):
+            raise RuntimeError(
+                f"Training produced a non-finite loss at epoch "
+                f"{trainer.state.epoch}, iteration {trainer.state.iteration}."
+            )
+        targets = trainer.state.batch[1]
+        batch_size = int(targets.shape[0])
+        epoch_train_loss["weighted_sum"] += batch_loss * batch_size
+        epoch_train_loss["samples"] += batch_size
 
     @trainer.on(Events.EPOCH_COMPLETED)
-    def log_devel_results(trainer):
-        epoch_metrics = {}
-        epoch_confusion_matrices = {}
-        for L, loader in loaders.items():
-            metrics, confusion_matrix = log_metrics(
-                trainer,
-                loader,
-                log_prefix=f"{L}_",
+    def finalize_epoch_train_loss(trainer):
+        if not epoch_train_loss["samples"]:
+            raise RuntimeError(
+                f"Epoch {trainer.state.epoch} completed without training samples."
             )
-            epoch_metrics[L] = metrics
-            epoch_confusion_matrices[L] = confusion_matrix
-        wandb.log({"lr": get_current_lr(optimizer)}, step=trainer.state.epoch)
+        epoch_train_loss["mean"] = (
+            epoch_train_loss["weighted_sum"] / epoch_train_loss["samples"]
+        )
 
-        devel_metrics = epoch_metrics.get("devel", {})
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def evaluate_devel_and_checkpoint(trainer):
+        devel_metrics, devel_confusion_matrix = evaluate_metrics(
+            loaders["devel"],
+            "devel",
+        )
+        epoch_log = {
+            "epoch": trainer.state.epoch,
+            "train/loss": epoch_train_loss["mean"],
+            "optimizer/lr": get_current_lr(optimizer),
+            "devel/confusion_matrix": confusion_matrix_plot(
+                devel_confusion_matrix
+            ),
+        }
+        epoch_log.update(
+            {
+                f"devel/{WANDB_METRIC_NAMES[key]}": value
+                for key, value in devel_metrics.items()
+            }
+        )
+        wandb_run.log(epoch_log)
+
         devel_macro_f1 = devel_metrics.get("f1")
         if devel_macro_f1 is None or not math.isfinite(devel_macro_f1):
             logging.warning(
@@ -306,11 +349,15 @@ def create_trainer(
             best_state["score"] = devel_macro_f1
             best_state["epoch"] = trainer.state.epoch
             best_state["metrics"] = {
-                f"{split}_{key}": value
-                for split, metrics in epoch_metrics.items()
-                for key, value in metrics.items()
+                "train_loss": epoch_train_loss["mean"],
+                **{
+                    f"devel_{key}": value
+                    for key, value in devel_metrics.items()
+                },
             }
-            best_state["confusion_matrices"] = epoch_confusion_matrices
+            best_state["confusion_matrices"] = {
+                "devel": devel_confusion_matrix,
+            }
             logging.info(
                 "Saved epoch %d as the best model (devel macro-F1 %.6f): %s",
                 trainer.state.epoch,
@@ -319,35 +366,69 @@ def create_trainer(
             )
 
     @trainer.on(Events.COMPLETED)
-    def save_best_metrics(_trainer):
-        if best_state["metrics"]:
-            payload = {
-                "best_epoch": best_state["epoch"],
-                "best_devel_macro_f1": best_state["score"],
-                "best_devel_accuracy": best_state["metrics"]["devel_accuracy"],
-                "metrics": best_state["metrics"],
-                "confusion_matrices": best_state["confusion_matrices"],
-            }
-            if wandb.run is not None:
-                wandb.run.summary["best_epoch"] = best_state["epoch"]
-                wandb.run.summary["best_devel_macro_f1"] = best_state["score"]
-                wandb.run.summary["best_devel_accuracy"] = best_state["metrics"][
-                    "devel_accuracy"
-                ]
-                for key, value in best_state["metrics"].items():
-                    wandb.run.summary[f"best_{key}"] = value
-
-            if run_dir is not None:
-                target_dir = Path(run_dir)
-                target_dir.mkdir(parents=True, exist_ok=True)
-                best_path = target_dir / "best_metrics.json"
-                best_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-                logging.info(f"Saved best metrics to {best_path}")
-        else:
+    def evaluate_best_model_and_save_metrics(trainer):
+        if not best_state["metrics"] or trainer.best_model_path != model_path:
             raise RuntimeError(
                 "Training completed without a devel macro-F1 result; "
                 "no best model was saved."
             )
+
+        logging.info(
+            "Reloading the epoch %d best model for final test evaluation: %s",
+            best_state["epoch"],
+            model_path,
+        )
+        load_model_state(model, model_path, device=device)
+
+        # The test split is intentionally hidden from model selection and is
+        # evaluated exactly once, after restoring the devel-selected model.
+        test_metrics, test_confusion_matrix = evaluate_metrics(
+            loaders["test"],
+            "test",
+        )
+        best_state["metrics"].update(
+            {
+                f"test_{key}": value
+                for key, value in test_metrics.items()
+            }
+        )
+        best_state["confusion_matrices"]["test"] = test_confusion_matrix
+
+        payload = {
+            "best_epoch": best_state["epoch"],
+            "best_devel_macro_f1": best_state["score"],
+            "best_devel_accuracy": best_state["metrics"]["devel_accuracy"],
+            "metrics": best_state["metrics"],
+            "confusion_matrices": best_state["confusion_matrices"],
+        }
+        # Best-model and final-test results are run outputs, not another epoch.
+        # Log only their rich charts; scalar results live exclusively in summary.
+        wandb_run.log(
+            {
+                "best/devel/confusion_matrix": confusion_matrix_plot(
+                    best_state["confusion_matrices"]["devel"]
+                ),
+                "best/test/confusion_matrix": confusion_matrix_plot(
+                    best_state["confusion_matrices"]["test"]
+                ),
+            }
+        )
+        wandb_run.summary["best/epoch"] = best_state["epoch"]
+        wandb_run.summary["best/train/loss"] = best_state["metrics"][
+            "train_loss"
+        ]
+        for split in ("devel", "test"):
+            for metric_name, wandb_name in WANDB_METRIC_NAMES.items():
+                wandb_run.summary[f"best/{split}/{wandb_name}"] = (
+                    best_state["metrics"][f"{split}_{metric_name}"]
+                )
+
+        if run_dir is not None:
+            target_dir = Path(run_dir)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            best_path = target_dir / "best_metrics.json"
+            best_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            logging.info(f"Saved best metrics to {best_path}")
 
     return trainer
 
@@ -360,7 +441,8 @@ def create_transfer_learner(
     device,
     *,
     model_path,
-    normalization_kwargs,
+    num_classes,
+    wandb_run,
     use_scheduler=True,
     gpu_transforms=None,
     num_epochs=32,
@@ -391,7 +473,8 @@ def create_transfer_learner(
         loaders,
         device,
         model_path=model_path,
-        normalization_kwargs=normalization_kwargs,
+        num_classes=num_classes,
+        wandb_run=wandb_run,
         use_scheduler=use_scheduler,
         gpu_transforms=gpu_transforms,
         num_epochs=num_epochs,
@@ -421,14 +504,13 @@ def create_transfer_learner(
                     block_name,
                 )
 
-        if wandb.run is not None:
-            wandb.log(
-                {
-                    "frozen_blocks": len(unfreezer.frozen_block_names),
-                    "newly_unfrozen_blocks": ",".join(unfrozen),
-                },
-                step=epoch,
-            )
+        wandb_run.log(
+            {
+                "epoch": epoch,
+                "transfer/frozen_blocks": len(unfreezer.frozen_block_names),
+                "transfer/newly_unfrozen_blocks": ",".join(unfrozen),
+            }
+        )
 
         if not unfreezer.frozen_block_names and not reported_all_trainable:
             logging.info("Epoch[%d]: all backbone blocks are trainable.", epoch)

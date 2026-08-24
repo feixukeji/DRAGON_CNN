@@ -18,8 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SPLITS = ("train", "devel", "test")
+SPLITS = ("devel", "test")
 BEST_METRICS_NAME = "best_metrics.json"
+REQUIRED_SPLIT_METRICS = ("accuracy", "precision", "recall", "loss", "f1")
 
 
 class ReportDataError(ValueError):
@@ -198,11 +199,6 @@ def _load_experiment(directory: Path) -> ExperimentMetrics:
     }
     missing = required - payload.keys()
     if missing:
-        if "confusion_matrices" in missing:
-            raise ReportDataError(
-                f"{metrics_path} uses the unsupported legacy schema: missing "
-                "'confusion_matrices'. Regenerate it with the current trainer."
-            )
         raise ReportDataError(
             f"{metrics_path} is missing required field(s): {sorted(missing)}"
         )
@@ -233,6 +229,29 @@ def _load_experiment(directory: Path) -> ExperimentMetrics:
             value,
             field=f"metrics.{key}",
             source=metrics_path,
+        )
+
+    required_metric_keys = {
+        f"{split}_{metric}"
+        for split in SPLITS
+        for metric in REQUIRED_SPLIT_METRICS
+    }
+    required_metric_keys.add("train_loss")
+    missing_metric_keys = required_metric_keys - stored_metrics.keys()
+    if missing_metric_keys:
+        raise ReportDataError(
+            f"metrics is missing required field(s) "
+            f"{sorted(missing_metric_keys)} in {metrics_path}"
+        )
+    if not math.isclose(
+        stored_metrics["devel_f1"],
+        best_score,
+        rel_tol=1e-7,
+        abs_tol=1e-9,
+    ):
+        raise ReportDataError(
+            f"metrics.devel_f1 does not match best_devel_macro_f1 in "
+            f"{metrics_path}"
         )
 
     raw_matrices = payload["confusion_matrices"]
@@ -448,6 +467,9 @@ def _report_experiment(
     print(f"  directory: {experiment.directory}")
     print(f"  metrics: {experiment.metrics_path}")
     print(f"  best epoch: {experiment.best_epoch}")
+    train_loss = experiment.stored_metrics.get("train_loss")
+    if train_loss is not None:
+        print(f"  recorded train loss at best epoch: {train_loss:.6f}")
     print(
         "  recorded best devel macro-F1: "
         f"{experiment.best_devel_macro_f1:.6f}"

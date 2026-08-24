@@ -79,7 +79,7 @@ def prepare_inference_data(
 
     tensors_dir = output / "tensors"
     h5_path = tensors_dir / "tensors.h5"
-    clean_info_path = tensors_dir / "clean_info.csv"
+    info_path = output / "info.csv"
     with tempfile.TemporaryDirectory(prefix=".prepare-", dir=output) as temp_dir:
         raw_info_path = Path(temp_dir) / "raw_info.csv"
         info.to_csv(raw_info_path, index=False)
@@ -88,22 +88,20 @@ def prepare_inference_data(
             csv_path=raw_info_path,
             out_dir=tensors_dir,
             bands=normalized_bands,
+            info_path=info_path,
             cutout_size=cutout_size,
             workers=workers,
         )
 
-    clean_info = pd.read_csv(clean_info_path, dtype={"object_id": str})
-    if clean_info.empty:
+    aligned_info = pd.read_csv(info_path, dtype={"object_id": str})
+    if aligned_info.empty:
         raise ValueError("No readable FITS cutouts remain after preprocessing")
-    info_path = output / "info.csv"
-    clean_info.to_csv(info_path, index=False)
-    clean_info_path.unlink()
 
     return PreparedInferenceData(
         output_dir=output,
         info_path=info_path,
         h5_path=h5_path,
-        rows=len(clean_info),
+        rows=len(aligned_info),
     )
 
 

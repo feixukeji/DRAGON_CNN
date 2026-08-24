@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,15 +27,19 @@ DRAGON_CLASS_ORDER = (
     "agn_star",
     "dual_agn",
 )
+TENSOR_STORE_COLUMN = "tensor_store"
+TENSOR_INDEX_COLUMN = "tensor_index"
+TENSOR_OBJECT_ID_COLUMN = "tensor_object_id"
 
 
 @dataclass(frozen=True)
 class ClassSpec:
-    """Survey-local catalog and cutout paths for one DRAGON class."""
+    """Survey-local catalog plus either FITS paths or tensor references."""
 
     name: str
     csv_path: Path
-    cutout_dir: Path
+    cutout_dir: Path | None
+    tensor_backed: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,23 +77,51 @@ def _load_objects(csv_path: Path) -> pd.DataFrame:
 def _build_rows(
     objects: pd.DataFrame,
     class_name: str,
-    cutout_dir: Path,
+    cutout_dir: Path | None,
     bands: Sequence[str],
+    *,
+    tensor_backed: bool,
+    split_assignments: Mapping[str, str] | None,
 ) -> pd.DataFrame:
     original_object_ids = objects["object_id"].astype(str)
     metadata_columns = ["object_id"]
     if {"ra", "dec"}.issubset(objects.columns):
         metadata_columns.extend(["ra", "dec"])
+    if "split" in objects.columns:
+        metadata_columns.append("split")
+    if tensor_backed:
+        required_tensor_columns = {
+            TENSOR_STORE_COLUMN,
+            TENSOR_INDEX_COLUMN,
+        }
+        missing = required_tensor_columns.difference(objects.columns)
+        if missing:
+            raise ValueError(
+                f"Tensor-backed class {class_name!r} is missing catalog "
+                f"column(s): {', '.join(sorted(missing))}"
+            )
+        metadata_columns.extend(
+            [TENSOR_STORE_COLUMN, TENSOR_INDEX_COLUMN]
+        )
     rows = add_class_prefix_to_object_ids(
         objects.loc[:, metadata_columns],
         class_name,
     )
     rows["class"] = class_name
-    for band in bands:
-        rows[band] = [
-            str(cutout_dir / f"{object_id}_{band}.fits")
-            for object_id in original_object_ids
-        ]
+    if "split" not in rows.columns and split_assignments is not None:
+        rows["split"] = original_object_ids.map(split_assignments)
+    if tensor_backed:
+        rows[TENSOR_OBJECT_ID_COLUMN] = original_object_ids.to_numpy()
+    else:
+        if cutout_dir is None:
+            raise ValueError(
+                f"FITS-backed class {class_name!r} requires cutout_dir"
+            )
+        for band in bands:
+            rows[band] = [
+                str(cutout_dir / f"{object_id}_{band}.fits")
+                for object_id in original_object_ids
+            ]
     return rows
 
 
@@ -130,15 +162,17 @@ def prepare_training_catalog(
     coordinate_tolerance_arcsec: float = DEFAULT_COORDINATE_TOLERANCE_ARCSEC,
     filter_coordinate_equivalent_duplicates: bool = True,
     context: str = "DRAGON training",
+    split_assignments: Mapping[str, str] | None = None,
 ) -> PreparedTrainingCatalog:
     """Write ``raw_info.csv`` and ``labels.csv`` for DRAGON training.
 
-    Band names are used exactly as supplied. Catalog and cutout paths remain
-    survey-owned configuration supplied through ``class_specs``. Every catalog
-    must contain ``object_id``. Catalogs that also contain both ``ra`` and
-    ``dec`` participate in coordinate-based duplicate filtering when
-    ``filter_coordinate_equivalent_duplicates`` is enabled; catalogs with
-    neither coordinate column skip that filtering.
+    Band names are used exactly as supplied. FITS-backed classes derive one
+    path per band from ``cutout_dir``; tensor-backed classes preserve the
+    catalog's ``tensor_store`` and ``tensor_index`` reference. An existing
+    ``split`` column is preserved; otherwise ``split_assignments`` supplies it
+    for real sources. Every catalog must contain ``object_id``. Catalogs with
+    both ``ra`` and ``dec`` participate in coordinate-based duplicate
+    filtering when enabled.
     """
     specs = list(class_specs)
     ordered_classes = list(class_order)
@@ -176,6 +210,8 @@ def prepare_training_catalog(
             spec.name,
             spec.cutout_dir,
             band_names,
+            tensor_backed=spec.tensor_backed,
+            split_assignments=split_assignments,
         )
         for spec in specs
     }

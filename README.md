@@ -71,20 +71,14 @@ python -m data_preprocessing.create_cutouts \
   --data-dir /path/to/fits_root \
   --csv-path /path/to/metadata.csv \
   --out-dir /path/to/dragon_dataset/tensors \
+  --info-path /path/to/dragon_dataset/info.csv \
   --bands i_band --bands r_band --bands g_band \
   --cutout-size 96
 ```
 
-This creates `tensors/tensors.h5` and `tensors/clean_info.csv`.
+This creates `tensors/tensors.h5` and the row-aligned `info.csv`.
 
-3. Publish the aligned metadata:
-
-```bash
-cp /path/to/dragon_dataset/tensors/clean_info.csv \
-  /path/to/dragon_dataset/info.csv
-```
-
-4. Create one deterministic, stratified train/devel/test split set. The
+3. Create one deterministic, stratified train/devel/test split set. The
    default split slug is `stratified`.
 
 ```bash
@@ -100,7 +94,7 @@ one. Every metadata row must contain a unique integer `h5_index` within the
 HDF5 tensor range. The loader fails on a missing or invalid mapping instead of
 guessing or clamping an index.
 
-5. Compute the global asinh normalization statistics from the training split:
+4. Compute the global asinh normalization statistics from the training split:
 
 ```bash
 python -m data_preprocessing.compute_normalization_stats \
@@ -154,9 +148,12 @@ python -m train.train \
 ```
 
 Training requires `/path/to/dragon_dataset/normalization_stats.json` to
-already exist. It always applies global asinh normalization using the JSON's
-per-channel limits and softening; it never computes statistics or accepts a
-separate softening value.
+already exist. At startup it reads the complete raw HDF5 tensor into RAM in
+bounded blocks, applies global asinh normalization once on the selected device,
+and shares that normalized `float32` array with every split and forked
+DataLoader worker. The source HDF5 remains unchanged, and batches are not
+normalized again. The current HSC dataset needs about 68.5 GiB for this array,
+so its training jobs request 128 GiB of host memory.
 
 `--project` selects the W&B cloud project, while `--experiment` names the W&B
 run and its local output directory. `--run_dir` is the shared run root. Each
@@ -175,6 +172,19 @@ Only the completed-epoch model with the best devel macro-F1 is saved as
 another training job with the same experiment name replaces that entire
 experiment directory, including any earlier inference products beneath it.
 Use distinct experiment names for results that must coexist.
+
+The devel split is evaluated after every epoch and is the only split used for
+model selection. After training, the trainer reloads that best checkpoint and
+evaluates test exactly once to produce the final metrics and confusion matrix.
+Training loss is accumulated from the existing training batches without a
+second train-set pass. The test split is therefore never consulted during model
+selection.
+
+W&B stores run arguments and model metadata in config. Epoch history contains
+only `train/loss`, `devel/*`, `optimizer/lr`, and transfer-learning state, all
+using `epoch` as their plotting axis. Final outputs use the `best/*` summary
+namespace: the selected epoch and its train/devel values plus the single test
+evaluation. Test scalars are not logged as a synthetic extra epoch.
 
 Other behavior:
 
@@ -253,9 +263,9 @@ python -m scripts.report_training_results \
 ```
 
 `--data-dir` supplies the dataset-level `labels.csv`. Use `--labels PATH` to
-override it, or omit both options to display numeric class indices. The current
-report schema requires the best epoch, metrics, and train/devel/test confusion
-matrices written by the current trainer.
+override it, or omit both options to display numeric class indices. The
+reporter expects the best epoch, training loss, and complete devel/test metrics
+and confusion matrices written by the trainer.
 
 ## Inference
 

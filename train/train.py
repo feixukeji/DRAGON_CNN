@@ -18,6 +18,7 @@ import kornia.augmentation as K
 from data_preprocessing import (
     FITSDataset,
     get_data_loader,
+    preload_h5_images,
 )
 from cnn import DRAGON, DRAGON_CUTOUT_SIZE, model_stats
 from .create_trainer import create_trainer, create_transfer_learner
@@ -90,9 +91,6 @@ class RandomDihedralAugmentation(nn.Module):
 
         for transform_id in range(8):
             mask = transform_ids == transform_id
-            if not torch.any(mask):
-                continue
-
             transformed = images[mask]
             if transform_id >= 4:
                 transformed = torch.flip(transformed, dims=(-1,))
@@ -361,6 +359,32 @@ def train(**kwargs):
     args["normalization_vmax"] = normalization_kwargs["vmax"]
     args["normalization_softening"] = normalization_kwargs["softening"]
 
+    expected_image_shape = (
+        args["channels"],
+        args["cutout_size"],
+        args["cutout_size"],
+    )
+    stored_image_shape = datasets["train"].h5_image_shape[1:]
+    if stored_image_shape != expected_image_shape:
+        raise click.ClickException(
+            "Stored HDF5 image shape does not match the training configuration: "
+            f"{stored_image_shape} != {expected_image_shape}"
+        )
+
+    # Training always holds one complete, already-normalized copy in
+    # parent-process RAM. All split datasets and forked DataLoader workers
+    # share these copy-on-write pages.
+    preloaded_images = preload_h5_images(
+        args["data_dir"],
+        normalization_kwargs=normalization_kwargs,
+        device=args["device"],
+    )
+    for dataset in datasets.values():
+        dataset.attach_preloaded_h5_images(preloaded_images)
+    args["hdf5_preloaded"] = True
+    args["hdf5_preloaded_gib"] = preloaded_images.nbytes / 2**30
+    args["normalization_stage"] = "hdf5_preload"
+
     # Keep each split's RNG independent so devel/test iteration cannot consume
     # the training shuffle stream. The generator also supplies reproducible
     # worker base seeds to _seed_data_loader_worker.
@@ -401,36 +425,16 @@ def train(**kwargs):
     # Log into W&B
     wandb.login()
 
+    # Configuration is immutable run input, not an epoch-zero history record.
+    args = {**args, **model_stats(model)}
+
     # Initializing W&B run
     with wandb.init(
         project=args["project"],
         name=args["experiment"],
         dir=str(experiment_dir),
-
-        # track hyperparameters and run metadata
-        config={
-            "num_classes": args["n_classes"],
-            "architecture": "CNN",
-            "parameters": {
-                "initial_learning_rate": args["lr0"],
-                "optimizer": args["optimizer"],
-                "momentum": args["momentum"],
-                "nesterov": args["nesterov"],
-                "weight_decay": args["weight_decay"],
-                "adamw_beta1": args["adamw_beta1"],
-                "adamw_beta2": args["adamw_beta2"],
-                "adamw_eps": args["adamw_eps"],
-                "max_grad_norm": args["max_grad_norm"],
-                "seed": args["seed"],
-                "epochs": args["epochs"],
-                "batch_size": args["batch_size"]
-            }
-        }
+        config={**args, "architecture": "CNN"},
     ) as run:
-        # Write the parameters and model stats to W&B
-        args = {**args, **model_stats(model)}
-        run.log(args)
-
         model_path = experiment_dir / "model.pt"
 
         # Set up trainer
@@ -443,7 +447,8 @@ def train(**kwargs):
                 loaders,
                 args["device"],
                 model_path=model_path,
-                normalization_kwargs=normalization_kwargs,
+                num_classes=args["n_classes"],
+                wandb_run=run,
                 use_scheduler=args["scheduler"],
                 gpu_transforms=train_transforms,
                 eval_gpu_transforms=eval_transforms,
@@ -460,7 +465,8 @@ def train(**kwargs):
                 loaders,
                 args["device"],
                 model_path=model_path,
-                normalization_kwargs=normalization_kwargs,
+                num_classes=args["n_classes"],
+                wandb_run=run,
                 use_scheduler=args["scheduler"],
                 gpu_transforms=train_transforms,
                 eval_gpu_transforms=eval_transforms,
