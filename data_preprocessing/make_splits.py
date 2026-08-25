@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
-import click
 import logging
 from pathlib import Path
+
+import click
 import numpy as np
 import pandas as pd
 
@@ -100,7 +100,7 @@ def main(
     info_path = data_dir / info_name
     if not info_path.is_file():
         raise click.ClickException(f"Metadata CSV not found: {info_path}")
-    df = pd.read_csv(info_path)
+    df = pd.read_csv(info_path, low_memory=False)
     if df.empty:
         raise click.ClickException(f"Metadata CSV contains no rows: {info_path}")
     if label_col not in df.columns:

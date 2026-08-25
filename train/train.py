@@ -1,27 +1,23 @@
-# -*- coding: utf-8 -*-
-from pathlib import Path
+import logging
+import random
 import re
 import shutil
+from functools import partial
+from pathlib import Path
 
 import click
-import logging
-from functools import partial
-
-import wandb
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 
-import kornia.augmentation as K
-
+from cnn import DRAGON, DRAGON_CUTOUT_SIZE, model_stats
 from data_preprocessing import (
-    FITSDataset,
+    HDF5Dataset,
     get_data_loader,
     preload_h5_images,
 )
-from cnn import DRAGON, DRAGON_CUTOUT_SIZE, model_stats
-from .create_trainer import create_trainer, create_transfer_learner
 from utils import (
     build_optimizer,
     discover_devices,
@@ -29,9 +25,7 @@ from utils import (
     normalization_kwargs_from_stats,
 )
 
-
-import random
-import numpy as np
+from .create_trainer import create_trainer, create_transfer_learner
 
 
 def _seed_training(seed):
@@ -119,17 +113,17 @@ class RandomDihedralAugmentation(nn.Module):
     help="Experiment name used for the W&B run and local output directory.",
 )
 @click.option(
-    "--model_state",
+    "--model-state",
     type=click.Path(exists=True, dir_okay=False),
     default=None,
 )
 @click.option(
-    "--data_dir",
+    "--data-dir",
     type=click.Path(exists=True, file_okay=False),
     required=True,
 )
 @click.option(
-    "--run_dir",
+    "--run-dir",
     type=click.Path(),
     default=None,
     help=(
@@ -138,7 +132,7 @@ class RandomDihedralAugmentation(nn.Module):
     ),
 )
 @click.option(
-    "--split_slug",
+    "--split-slug",
     type=str,
     required=True,
     help=(
@@ -146,11 +140,11 @@ class RandomDihedralAugmentation(nn.Module):
         "splits/<slug>-devel.csv, and splits/<slug>-test.csv."
     ),
 )
-@click.option("--cutout_size", type=int, default=96, show_default=True)
+@click.option("--cutout-size", type=int, default=96, show_default=True)
 @click.option("--channels", type=int, default=1)
-@click.option("--n_classes", type=int, default=6)
+@click.option("--n-classes", type=int, default=6)
 @click.option(
-    "--n_workers",
+    "--n-workers",
     type=int,
     default=4,
     help="Number of DataLoader worker processes.",
@@ -162,7 +156,7 @@ class RandomDihedralAugmentation(nn.Module):
     show_default=True,
     help="Seed model initialization, data shuffling, augmentation, and dropout.",
 )
-@click.option("--batch_size", type=int, default=16)
+@click.option("--batch-size", type=int, default=16)
 @click.option("--epochs", type=click.IntRange(min=1), default=40, show_default=True)
 @click.option(
     "--lr0",
@@ -172,7 +166,7 @@ class RandomDihedralAugmentation(nn.Module):
     help="Initial learning rate.",
 )
 @click.option("--momentum", type=float, default=0.9)
-@click.option("--weight_decay", type=float, default=0)
+@click.option("--weight-decay", type=float, default=0)
 @click.option(
     "--max-grad-norm",
     type=click.FloatRange(min=0.0),
@@ -190,13 +184,6 @@ class RandomDihedralAugmentation(nn.Module):
 @click.option("--adamw-beta2", type=click.FloatRange(0.0, 1.0, max_open=True), default=0.999, show_default=True)
 @click.option("--adamw-eps", type=click.FloatRange(min=0.0, min_open=True), default=1e-8, show_default=True)
 @click.option(
-    "--crop/--no-crop",
-    default=True,
-    help="""If True, all images are passed through a cropping
-operation before being fed into the network. Images are cropped
-to the cutout_size parameter""",
-)
-@click.option(
     "--nesterov/--no-nesterov",
     default=False,
     help="""Whether to use Nesterov momentum or not""",
@@ -207,10 +194,10 @@ to the cutout_size parameter""",
     help="Randomly apply one of the eight right-angle rotation/horizontal-flip transforms to each training sample.",
 )
 @click.option(
-    "--train/--transfer_learn",
+    "--train/--transfer-learn",
     default=True,
     help="""Specifies whether you wish to do transfer learning. If transfer learning,
-    you must specify model path in the model_state argument."""
+    you must specify a model path with --model-state."""
 )
 @click.option(
     "--unfreeze-warmup-epochs",
@@ -232,7 +219,7 @@ to the cutout_size parameter""",
     show_default=True,
 )
 @click.option(
-    "--class_weight",
+    "--class-weight",
     type=click.Choice(["none", "balanced"], case_sensitive=False),
     default="none",
     help="Use class weights in the loss. 'balanced' uses n_samples / (n_classes * class_count) from the train split.",
@@ -247,11 +234,11 @@ def train(**kwargs):
     logging.info("Using training seed %d.", args["seed"])
 
     if not args["train"] and not args["model_state"]:
-        raise click.UsageError("Transfer learning requires --model_state.")
+        raise click.UsageError("Transfer learning requires --model-state.")
     if args["cutout_size"] != DRAGON_CUTOUT_SIZE:
         raise click.BadParameter(
             f"DRAGON requires {DRAGON_CUTOUT_SIZE}x{DRAGON_CUTOUT_SIZE} inputs",
-            param_hint="--cutout_size",
+            param_hint="--cutout-size",
         )
 
     for parameter in ("project", "experiment"):
@@ -314,21 +301,14 @@ def train(**kwargs):
         n_workers=args["n_workers"],
     )
 
-    # Keep deterministic preprocessing separate from train-only random augmentation.
-    eval_transforms = []
-    if args["crop"]:
-        eval_transforms.append(K.CenterCrop(args["cutout_size"]))
-    train_transforms = list(eval_transforms)
-    if args["augment"]:
-        train_transforms.append(RandomDihedralAugmentation())
-
-    train_transforms = train_transforms or None
-    eval_transforms = eval_transforms or None
+    train_transforms = (
+        [RandomDihedralAugmentation()] if args["augment"] else None
+    )
 
     # Generate the DataLoaders and log the train/devel/test split sizes
     splits = ("train", "devel", "test")
     datasets = {
-        k: FITSDataset(
+        k: HDF5Dataset(
             data_dir=args["data_dir"],
             slug=args["split_slug"],
             split=k,
@@ -450,8 +430,7 @@ def train(**kwargs):
                 num_classes=args["n_classes"],
                 wandb_run=run,
                 use_scheduler=args["scheduler"],
-                gpu_transforms=train_transforms,
-                eval_gpu_transforms=eval_transforms,
+                train_transforms=train_transforms,
                 num_epochs=args["epochs"],
                 run_dir=experiment_dir,
                 max_grad_norm=args["max_grad_norm"],
@@ -468,8 +447,7 @@ def train(**kwargs):
                 num_classes=args["n_classes"],
                 wandb_run=run,
                 use_scheduler=args["scheduler"],
-                gpu_transforms=train_transforms,
-                eval_gpu_transforms=eval_transforms,
+                train_transforms=train_transforms,
                 unfreeze_warmup_epochs=args["unfreeze_warmup_epochs"],
                 unfreeze_blocks_per_epoch=args["unfreeze_blocks_per_epoch"],
                 num_epochs=args["epochs"],

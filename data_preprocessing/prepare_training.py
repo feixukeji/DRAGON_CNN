@@ -15,7 +15,6 @@ from .catalog_validation import (
     require_unique_object_ids,
 )
 
-
 DRAGON_CLASS_ORDER = (
     "rubbish",
     "empty",
@@ -58,7 +57,11 @@ class EmptyTrainingCatalogError(ValueError):
 
 
 def _load_objects(csv_path: Path) -> pd.DataFrame:
-    frame = pd.read_csv(csv_path, dtype={"object_id": str})
+    frame = pd.read_csv(
+        csv_path,
+        dtype={"object_id": "string"},
+        low_memory=False,
+    )
     if "object_id" not in frame:
         raise ValueError(
             f"Missing required column(s) in {csv_path}: object_id"
@@ -87,7 +90,9 @@ def _build_rows(
     metadata_columns = ["object_id"]
     if {"ra", "dec"}.issubset(objects.columns):
         metadata_columns.extend(["ra", "dec"])
-    if "split" in objects.columns:
+    if "split" in objects.columns and (
+        tensor_backed or split_assignments is None
+    ):
         metadata_columns.append("split")
     if tensor_backed:
         required_tensor_columns = {
@@ -100,6 +105,11 @@ def _build_rows(
                 f"Tensor-backed class {class_name!r} is missing catalog "
                 f"column(s): {', '.join(sorted(missing))}"
             )
+        if split_assignments is not None and "split" not in objects.columns:
+            raise ValueError(
+                f"Tensor-backed class {class_name!r} is missing catalog "
+                "column: split"
+            )
         metadata_columns.extend(
             [TENSOR_STORE_COLUMN, TENSOR_INDEX_COLUMN]
         )
@@ -108,8 +118,16 @@ def _build_rows(
         class_name,
     )
     rows["class"] = class_name
-    if "split" not in rows.columns and split_assignments is not None:
-        rows["split"] = original_object_ids.map(split_assignments)
+    if not tensor_backed and split_assignments is not None:
+        assigned_splits = original_object_ids.map(split_assignments)
+        missing_assignments = assigned_splits.isna()
+        if missing_assignments.any():
+            examples = original_object_ids.loc[missing_assignments].head(5).tolist()
+            raise ValueError(
+                f"FITS-backed class {class_name!r} contains object IDs absent "
+                f"from the split manifest: {examples}"
+            )
+        rows["split"] = assigned_splits
     if tensor_backed:
         rows[TENSOR_OBJECT_ID_COLUMN] = original_object_ids.to_numpy()
     else:
@@ -169,8 +187,9 @@ def prepare_training_catalog(
     Band names are used exactly as supplied. FITS-backed classes derive one
     path per band from ``cutout_dir``; tensor-backed classes preserve the
     catalog's ``tensor_store`` and ``tensor_index`` reference. An existing
-    ``split`` column is preserved; otherwise ``split_assignments`` supplies it
-    for real sources. Every catalog must contain ``object_id``. Catalogs with
+    ``split`` column is preserved for tensor-backed rows. When supplied,
+    ``split_assignments`` is authoritative for every FITS-backed row. Every
+    catalog must contain ``object_id``. Catalogs with
     both ``ra`` and ``dec`` participate in coordinate-based duplicate
     filtering when enabled.
     """

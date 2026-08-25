@@ -375,8 +375,23 @@ def _format_count(value: float) -> str:
     return str(int(value)) if value.is_integer() else f"{value:g}"
 
 
+def _format_confusion_cell(count: float, actual_class_total: float) -> str:
+    percentage = (
+        100.0 * count / actual_class_total if actual_class_total else 0.0
+    )
+    return f"{_format_count(count)} ({percentage:.1f}%)"
+
+
 def _print_confusion_matrix(matrix: list[list[float]], labels: list[str]) -> None:
-    values = [[_format_count(value) for value in row] for row in matrix]
+    values = []
+    for row in matrix:
+        actual_class_total = sum(row)
+        values.append(
+            [
+                _format_confusion_cell(count, actual_class_total)
+                for count in row
+            ]
+        )
     corner_label = "actual\\predicted"
     label_width = max(len(corner_label), *(len(label) for label in labels))
     column_widths = [
@@ -386,7 +401,7 @@ def _print_confusion_matrix(matrix: list[list[float]], labels: list[str]) -> Non
     header = f"      {corner_label:<{label_width}}  " + "  ".join(
         f"{label:>{column_widths[index]}}" for index, label in enumerate(labels)
     )
-    print("    confusion matrix:")
+    print("    confusion matrix (absolute count (percentage of actual class)):")
     print(header)
     for row_index, label in enumerate(labels):
         print(
@@ -429,18 +444,21 @@ def _print_split(metrics: SplitMetrics, stored_metrics: dict[str, float]) -> Non
             f"{_format_metric(float(row['recall'])):>6}  "
             f"{_format_metric(float(row['f1'])):>6}"
         )
-    _print_confusion_matrix(metrics.confusion_matrix, [str(row["class"]) for row in metrics.per_class])
+    _print_confusion_matrix(
+        metrics.confusion_matrix,
+        [str(row["class"]) for row in metrics.per_class],
+    )
 
 
 def _resolve_labels(args: argparse.Namespace, class_count: int) -> list[str]:
     labels_path: Path | None = args.labels
     if labels_path is None and args.data_dir is not None:
-        candidate = args.data_dir / "labels.csv"
-        if candidate.is_file():
-            labels_path = candidate
+        labels_path = args.data_dir / "labels.csv"
 
     if labels_path is None:
-        return [str(index) for index in range(class_count)]
+        raise ReportDataError(
+            "Class names are required; provide --labels PATH or --data-dir DIR"
+        )
     if not labels_path.is_file():
         raise ReportDataError(f"Labels CSV not found: {labels_path}")
 
@@ -502,8 +520,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-dir",
         type=Path,
         help=(
-            "Dataset directory used to discover labels.csv when --labels is omitted. "
-            "Numeric class labels are used when the file is absent."
+            "Dataset directory containing the labels.csv used for class names when "
+            "--labels is omitted."
         ),
     )
     parser.add_argument(

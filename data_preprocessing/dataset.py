@@ -1,23 +1,52 @@
 import logging
-from pathlib import Path
 import time
+from pathlib import Path
 
-from astropy.io import fits
 import h5py
 import numpy as np
 import pandas as pd
-
 import torch
-from torch.utils.data import Dataset
 import torch.multiprocessing as mp
+from torch.utils.data import Dataset
 
-from utils import asinh_normalize, load_data_dir
+from utils import asinh_normalize
 
 mp.set_sharing_strategy("file_system")
 
 
 H5_IMAGES_NAME = "images"
 H5_PRELOAD_BLOCK_BYTES = 512 * 1024**2
+
+
+def _metadata_path(data_dir, slug, split):
+    if split is None:
+        return data_dir / "info.csv"
+    if not slug:
+        raise ValueError("A split slug is required when loading a dataset split.")
+    return data_dir / "splits" / f"{slug}-{split}.csv"
+
+
+def _load_hdf5_metadata(data_dir, slug, split, label_col, load_labels):
+    """Load only metadata used to address and label HDF5 image rows."""
+    catalog = _metadata_path(data_dir, slug, split)
+    required_columns = ["object_id", "h5_index"]
+    if load_labels:
+        required_columns.append(label_col)
+    required_columns = list(dict.fromkeys(required_columns))
+    required_set = set(required_columns)
+
+    metadata = pd.read_csv(
+        catalog,
+        usecols=lambda column: column in required_set,
+        dtype={column: "string" for column in required_columns},
+    )
+    missing_columns = required_set.difference(metadata.columns)
+    if missing_columns:
+        raise KeyError(
+            f"Metadata CSV {catalog} is missing required column(s): "
+            + ", ".join(sorted(missing_columns))
+        )
+    return metadata
 
 
 def _validate_h5_images(images, h5_path):
@@ -153,8 +182,8 @@ def preload_h5_images(
     return preloaded
 
 
-class FITSDataset(Dataset):
-    """Read row-aligned tensors from HDF5 or a shared in-memory preload."""
+class HDF5Dataset(Dataset):
+    """Read catalog-selected tensors from HDF5 or a shared memory preload."""
 
     def __init__(
             self,
@@ -162,40 +191,36 @@ class FITSDataset(Dataset):
             label_col="class",
             slug=None,
             split=None,
-            transforms=None,
             load_labels=True,
     ):
-        # Set data directories
         self.data_dir = Path(data_dir)
-        self.tensors_path = self.data_dir / "tensors"
 
-        # Initialize image metadata
-        self.transform = transforms
+        self.data_info = _load_hdf5_metadata(
+            self.data_dir,
+            slug,
+            split,
+            label_col,
+            load_labels,
+        )
 
-        # Define paths and load dataframe.
-        self.data_info = load_data_dir(self.data_dir, slug, split)
-        if "object_id" not in self.data_info.columns:
-            raise KeyError(
-                "Metadata CSV must contain 'object_id' for HDF5 loading; "
-                "legacy 'file_name' datasets are unsupported."
-            )
-
-        # Loading labels
         if load_labels:
             label_info_path = self.data_dir / "labels.csv"
             if label_info_path.is_file():
-                label_df = pd.read_csv(label_info_path)
-                self.label_dict = {row["key"]: row["value"] for _, row in label_df.iterrows()}
-                self.labels = np.asarray([self.label_dict[v] for v in self.data_info[label_col]])
+                label_df = pd.read_csv(
+                    label_info_path,
+                    dtype={"key": "string", "value": "Int64"},
+                )
+                label_mapping = dict(zip(label_df["key"], label_df["value"]))
+                self.labels = np.asarray(
+                    [label_mapping[value] for value in self.data_info[label_col]],
+                    dtype=np.int64,
+                )
             else:
                 self.labels = np.asarray(self.data_info[label_col])
-
         else:
             self.labels = np.ones(len(self.data_info), dtype=int)
 
-        # HDF5 initialization variables.
-        self.use_h5 = True
-        self.h5_path = self.tensors_path / "tensors.h5"
+        self.h5_path = self.data_dir / "tensors" / "tensors.h5"
         self.h5_file = None
         self.h5_images = None
 
@@ -203,13 +228,6 @@ class FITSDataset(Dataset):
             raise FileNotFoundError(
                 f"HDF5 dataset not found at {self.h5_path}. "
                 "Please run create_cutouts.py first."
-            )
-
-        if "h5_index" not in self.data_info.columns:
-            raise KeyError(
-                "Metadata CSV must contain 'h5_index'; implicit row-to-HDF5 "
-                "mapping is unsupported. Regenerate the metadata with "
-                "create_cutouts.py."
             )
 
         h5_index = self.data_info["h5_index"]
@@ -226,6 +244,7 @@ class FITSDataset(Dataset):
             )
 
         self.h5_indices = numeric_h5_index.to_numpy(dtype=np.int64)
+        self.data_info["h5_index"] = self.h5_indices
         negative_mask = self.h5_indices < 0
         if negative_mask.any():
             invalid_rows = self.data_info.index[negative_mask].tolist()[:5]
@@ -336,37 +355,3 @@ class FITSDataset(Dataset):
                 self.h5_file.close()
             except Exception:
                 pass
-
-    @staticmethod
-    def load_fits_as_tensor(filename):
-        """Open a FITS file and convert it to a Torch tensor, hunting for the correct HDU."""
-        fits_np = None
-
-        try:
-            fits_np = fits.getdata(filename, memmap=False)
-        except OSError as e:
-            logging.error(f"ERROR: {filename} is empty or corrupted. Shutting down")
-            raise e
-        except Exception:
-            pass
-
-        # Fallback: Hunt for the 2D data array if getdata fails
-        if fits_np is None or not hasattr(fits_np, 'shape') or len(fits_np.shape) < 2:
-            try:
-                with fits.open(filename, memmap=False) as hdul:
-                    for hdu in hdul:
-                        if hdu.data is not None and hasattr(hdu.data, 'shape') and len(hdu.data.shape) >= 2:
-                            fits_np = hdu.data
-                            break
-                    else:
-                        logging.error(f"ERROR: No valid 2D image array found in {filename}.")
-                        raise ValueError(f"No valid image array in {filename}")
-            except OSError as e:
-                logging.error(f"ERROR: {filename} is empty or corrupted. Shutting down")
-                raise e
-
-        # Replace NaNs and convert to float32 tensor
-        fits_np = np.nan_to_num(fits_np, nan=0.0)
-        tensor = torch.from_numpy(fits_np.astype(np.float32))
-
-        return tensor

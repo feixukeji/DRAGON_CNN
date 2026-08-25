@@ -10,15 +10,9 @@ import h5py
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
+from astropy.io import fits
 from tqdm import tqdm
-
-from utils import center_crop_or_pad_torch
-
-try:
-    from .dataset import FITSDataset
-except ImportError:  # Support direct execution as a script.
-    from dataset import FITSDataset
-
 
 MAX_BATCH_ROWS = 64
 TARGET_BATCH_BYTES = 8 * 1024 * 1024
@@ -43,6 +37,75 @@ class ObjectTask(NamedTuple):
 
 
 _PAIR_H5_CACHE = {}
+
+
+def _load_fits_tensor(filename):
+    """Load the first usable 2D FITS image as a float32 tensor."""
+    image = None
+    try:
+        image = fits.getdata(filename, memmap=False)
+    except (IndexError, KeyError, TypeError, ValueError):
+        pass
+
+    if image is None or not hasattr(image, "shape") or image.ndim != 2:
+        with fits.open(filename, memmap=False) as hdus:
+            image = next(
+                (
+                    hdu.data
+                    for hdu in hdus
+                    if hdu.data is not None
+                    and hasattr(hdu.data, "shape")
+                    and hdu.data.ndim == 2
+                ),
+                None,
+            )
+        if image is None:
+            raise ValueError(f"No valid 2D image array in {filename}")
+
+    image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.from_numpy(image.astype(np.float32))
+
+
+def _center_crop_or_pad_tensor(tensor, size):
+    """Center-crop or zero-pad a 2D tensor to a square of ``size`` pixels."""
+    height, width = tensor.shape
+    pad_height = max(0, size - height)
+    pad_width = max(0, size - width)
+    if pad_height or pad_width:
+        pad_top = pad_height // 2
+        pad_bottom = pad_height - pad_top
+        pad_left = pad_width // 2
+        pad_right = pad_width - pad_left
+        tensor = F.pad(
+            tensor,
+            (pad_left, pad_right, pad_top, pad_bottom),
+            mode="constant",
+            value=0.0,
+        )
+        height, width = tensor.shape
+
+    start_y = height // 2 - size // 2
+    start_x = width // 2 - size // 2
+    return tensor[start_y:start_y + size, start_x:start_x + size]
+
+
+def _build_runtime_metadata(df, successful_indices, bands):
+    """Drop tensor-construction references from aligned runtime metadata."""
+    source_columns = {
+        *bands,
+        TENSOR_STORE_COLUMN,
+        TENSOR_INDEX_COLUMN,
+        TENSOR_OBJECT_ID_COLUMN,
+    }
+    runtime_columns = [
+        column for column in df.columns if column not in source_columns
+    ]
+    aligned_info = df.iloc[successful_indices].loc[:, runtime_columns].copy()
+    aligned_info["h5_index"] = np.arange(
+        len(aligned_info),
+        dtype=np.int64,
+    )
+    return aligned_info
 
 
 def _load_pair_h5_tensor(task):
@@ -85,6 +148,16 @@ def _load_pair_h5_tensor(task):
                     "Pair HDF5 object_ids must align with images: "
                     f"{task.tensor_store}"
                 )
+            expected_shape = (
+                len(task.bands),
+                task.cutout_size,
+                task.cutout_size,
+            )
+            if tuple(images.shape[1:]) != expected_shape:
+                raise ValueError(
+                    f"Pair tensor shape {tuple(images.shape[1:])} does not "
+                    f"match expected {expected_shape}: {task.tensor_store}"
+                )
             cached = (handle, images, object_ids)
             _PAIR_H5_CACHE[task.tensor_store] = cached
         except BaseException:
@@ -92,16 +165,6 @@ def _load_pair_h5_tensor(task):
             raise
 
     _, images, object_ids = cached
-    expected_shape = (
-        len(task.bands),
-        task.cutout_size,
-        task.cutout_size,
-    )
-    if tuple(images.shape[1:]) != expected_shape:
-        raise ValueError(
-            f"Pair tensor shape {tuple(images.shape[1:])} does not match "
-            f"expected {expected_shape}: {task.tensor_store}"
-        )
     if task.tensor_index < 0 or task.tensor_index >= images.shape[0]:
         raise IndexError(
             f"Pair tensor index {task.tensor_index} is outside [0, "
@@ -118,18 +181,17 @@ def _load_pair_h5_tensor(task):
             f"catalog={task.tensor_object_id!r}, "
             f"HDF5={stored_object_id!r}, store={task.tensor_store}"
         )
-    array = np.asarray(images[task.tensor_index], dtype=np.float32)
+    array = np.asarray(images[task.tensor_index])
     if not np.isfinite(array).all():
         raise ValueError(
             f"Pair tensor contains NaN or Inf at index {task.tensor_index}: "
             f"{task.tensor_store}"
         )
-    return np.ascontiguousarray(array)
+    return array
 
 
-def process_single_object(task_args):
+def process_single_object(task):
     """Load one FITS-backed or pair-HDF5-backed tensor row."""
-    task = ObjectTask(*task_args)
     if task.tensor_store is not None:
         return task.df_index, _load_pair_h5_tensor(task)
 
@@ -139,8 +201,8 @@ def process_single_object(task_args):
 
     for fits_path in task.fits_paths:
         try:
-            tensor_2d = FITSDataset.load_fits_as_tensor(fits_path)
-            tensor_2d = center_crop_or_pad_torch(
+            tensor_2d = _load_fits_tensor(fits_path)
+            tensor_2d = _center_crop_or_pad_tensor(
                 tensor_2d,
                 task.cutout_size,
             )
@@ -369,9 +431,21 @@ def create_cutout_tensors(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(csv_path, dtype={"object_id": str})
+    df = pd.read_csv(
+        csv_path,
+        dtype={
+            "object_id": "string",
+            **{band: "string" for band in bands},
+            TENSOR_STORE_COLUMN: "string",
+            TENSOR_INDEX_COLUMN: "Int64",
+            TENSOR_OBJECT_ID_COLUMN: "string",
+        },
+        low_memory=False,
+    )
     if df.empty:
         raise ValueError(f"Metadata CSV contains no rows: {csv_path}")
+    if "object_id" not in df.columns:
+        raise ValueError(f"Metadata CSV is missing object_id: {csv_path}")
     tensor_rows, tensor_indices = _validate_input_rows(df, bands)
     fits_count = int((~tensor_rows).sum())
     tensor_count = int(tensor_rows.sum())
@@ -388,8 +462,6 @@ def create_cutout_tensors(
     h5_path = out_dir / "tensors.h5"
     temporary_h5_path = out_dir / "tensors.h5.incomplete"
     temporary_info_path = info_path.with_name(info_path.name + ".incomplete")
-    temporary_h5_path.unlink(missing_ok=True)
-    temporary_info_path.unlink(missing_ok=True)
 
     try:
         # Only this parent process writes the final HDF5 file. Workers return
@@ -442,11 +514,12 @@ def create_cutout_tensors(
             if current_h5_idx < max_len:
                 dset.resize(current_h5_idx, axis=0)
 
-        # Filter unreadable FITS rows and publish the exact row-to-HDF5 map.
-        aligned_info = df.iloc[successful_indices].copy()
-        aligned_info["h5_index"] = np.arange(
-            len(aligned_info),
-            dtype=np.int64,
+        # Publish only runtime metadata plus the exact row-to-HDF5 map. Source
+        # FITS and pair-HDF5 references remain in the input raw_info.csv.
+        aligned_info = _build_runtime_metadata(
+            df,
+            successful_indices,
+            bands,
         )
         info_path.parent.mkdir(parents=True, exist_ok=True)
         aligned_info.to_csv(temporary_info_path, index=False)

@@ -1,25 +1,22 @@
 import json
+import logging
 import math
-from pathlib import Path
 import re
+from pathlib import Path
 
 import torch
 import wandb
-
-from ignite.engine import (
-    Events,
-    create_supervised_trainer,
-    create_supervised_evaluator,
-)
-from ignite.metrics import Loss, Accuracy, Precision, ConfusionMatrix, Recall, Fbeta
 from ignite.contrib.handlers import ProgressBar
 from ignite.contrib.handlers.param_scheduler import LRScheduler
-import logging
-
+from ignite.engine import (
+    Events,
+    create_supervised_evaluator,
+    create_supervised_trainer,
+)
+from ignite.metrics import Accuracy, ConfusionMatrix, Fbeta, Loss, Precision, Recall
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from utils import load_model_state
-
 
 WANDB_METRIC_NAMES = {
     "accuracy": "accuracy",
@@ -135,10 +132,9 @@ def create_trainer(
     num_classes,
     wandb_run,
     use_scheduler=True,
-    gpu_transforms=None,
+    train_transforms=None,
     num_epochs=32,
     run_dir=None,
-    eval_gpu_transforms=None,
     max_grad_norm=1.0,
 ):
     """Set up Ignite trainer with train-only augmentation and deterministic evaluation."""
@@ -172,10 +168,10 @@ def create_trainer(
         return x, y
 
     def prepare_train_batch(batch, device, non_blocking):
-        return custom_prepare_batch(batch, device, non_blocking, gpu_transforms)
+        return custom_prepare_batch(batch, device, non_blocking, train_transforms)
 
     def prepare_eval_batch(batch, device, non_blocking):
-        return custom_prepare_batch(batch, device, non_blocking, eval_gpu_transforms)
+        return custom_prepare_batch(batch, device, non_blocking, None)
 
     # 2. Pass the custom function to the trainer
     trainer = create_supervised_trainer(
@@ -444,10 +440,9 @@ def create_transfer_learner(
     num_classes,
     wandb_run,
     use_scheduler=True,
-    gpu_transforms=None,
+    train_transforms=None,
     num_epochs=32,
     run_dir=None,
-    eval_gpu_transforms=None,
     unfreeze_warmup_epochs=3,
     unfreeze_blocks_per_epoch=1,
     max_grad_norm=1.0,
@@ -476,10 +471,9 @@ def create_transfer_learner(
         num_classes=num_classes,
         wandb_run=wandb_run,
         use_scheduler=use_scheduler,
-        gpu_transforms=gpu_transforms,
+        train_transforms=train_transforms,
         num_epochs=num_epochs,
         run_dir=run_dir,
-        eval_gpu_transforms=eval_gpu_transforms,
         max_grad_norm=max_grad_norm,
     )
 

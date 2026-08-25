@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import shutil
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
 import click
 import pandas as pd
@@ -47,7 +47,11 @@ def prepare_inference_data(
     if workers <= 0:
         raise ValueError("workers must be positive")
 
-    info = pd.read_csv(catalog, dtype={"object_id": str})
+    info = pd.read_csv(
+        catalog,
+        dtype={"object_id": "string"},
+        low_memory=False,
+    )
     if "object_id" not in info.columns:
         raise ValueError(f"Catalog is missing object_id column: {catalog}")
     if info["object_id"].isna().any():
@@ -93,7 +97,11 @@ def prepare_inference_data(
             workers=workers,
         )
 
-    aligned_info = pd.read_csv(info_path, dtype={"object_id": str})
+    aligned_info = pd.read_csv(
+        info_path,
+        dtype={"object_id": "string"},
+        low_memory=False,
+    )
     if aligned_info.empty:
         raise ValueError("No readable FITS cutouts remain after preprocessing")
 

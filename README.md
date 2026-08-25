@@ -76,7 +76,9 @@ python -m data_preprocessing.create_cutouts \
   --cutout-size 96
 ```
 
-This creates `tensors/tensors.h5` and the row-aligned `info.csv`.
+This creates `tensors/tensors.h5` and the row-aligned `info.csv`. FITS band
+paths and pair-HDF5 source references remain only in the input metadata
+(normally `raw_info.csv`); they are not copied into the runtime `info.csv`.
 
 3. Create one deterministic, stratified train/devel/test split set. The
    default split slug is `stratified`.
@@ -114,6 +116,7 @@ Expected dataset layout:
 
 ```text
 dragon_dataset/
+  raw_info.csv
   info.csv
   labels.csv
   normalization_stats.json
@@ -136,14 +139,14 @@ are not supported. The following example trains a six-class, three-channel,
 python -m train.train \
   --project dragon \
   --experiment seed42 \
-  --data_dir /path/to/dragon_dataset \
-  --run_dir /path/to/dragon_runs \
-  --split_slug stratified \
-  --cutout_size 96 \
+  --data-dir /path/to/dragon_dataset \
+  --run-dir /path/to/dragon_runs \
+  --split-slug stratified \
+  --cutout-size 96 \
   --channels 3 \
-  --n_classes 6 \
+  --n-classes 6 \
   --epochs 40 \
-  --batch_size 16 \
+  --batch-size 16 \
   --optimizer sgd
 ```
 
@@ -155,8 +158,12 @@ DataLoader worker. The source HDF5 remains unchanged, and batches are not
 normalized again. The current HSC dataset needs about 68.5 GiB for this array,
 so its training jobs request 128 GiB of host memory.
 
+Split CSV files supply only `object_id`, `class`, and `h5_index` at training
+time. FITS path and tensor-source columns are not parsed or dereferenced after
+the final `tensors.h5` has been created.
+
 `--project` selects the W&B cloud project, while `--experiment` names the W&B
-run and its local output directory. `--run_dir` is the shared run root. Each
+run and its local output directory. `--run-dir` is the shared run root. Each
 experiment owns exactly one directory:
 
 ```text
@@ -190,8 +197,7 @@ Other behavior:
 
 - `--seed 42` is the default for reproducible model initialization, data
   shuffling, training augmentation, dropout, and DataLoader workers.
-- `--crop` applies center-cropping and `--augment` applies train-only dihedral
-  transforms on the selected device.
+- `--augment` applies train-only dihedral transforms on the selected device.
 - The training label column is `class` by default.
 
 The optimizer can be selected without changing code:
@@ -201,7 +207,7 @@ The optimizer can be selected without changing code:
 python -m train.train ... --optimizer sgd --lr0 1e-3 --momentum 0.9 --nesterov
 
 # AdamW; momentum and nesterov are ignored
-python -m train.train ... --optimizer adamw --lr0 3e-5 --weight_decay 1e-4
+python -m train.train ... --optimizer adamw --lr0 3e-5 --weight-decay 1e-4
 ```
 
 AdamW uses `--adamw-beta1`, `--adamw-beta2`, and `--adamw-eps`; bias and
@@ -230,14 +236,14 @@ matching classifier weights are reinitialized for that output size.
 python -m train.train \
   --project dragon-transfer \
   --experiment seed42 \
-  --transfer_learn \
+  --transfer-learn \
   --unfreeze-warmup-epochs 3 \
   --unfreeze-blocks-per-epoch 1 \
   --lr0 2e-5 \
-  --model_state /tmp/dragon-model-adapted.pt \
-  --data_dir /path/to/dragon_dataset \
-  --run_dir /path/to/dragon_runs \
-  --split_slug stratified
+  --model-state /tmp/dragon-model-adapted.pt \
+  --data-dir /path/to/dragon_dataset \
+  --run-dir /path/to/dragon_runs \
+  --split-slug stratified
 ```
 
 Transfer learning first trains `fc1` and `fc2`, then unfreezes complete
@@ -263,9 +269,11 @@ python -m scripts.report_training_results \
 ```
 
 `--data-dir` supplies the dataset-level `labels.csv`. Use `--labels PATH` to
-override it, or omit both options to display numeric class indices. The
-reporter expects the best epoch, training loss, and complete devel/test metrics
-and confusion matrices written by the trainer.
+override it. One of these options is required so that reports use class names
+instead of numeric indices. Confusion-matrix cells are shown as an absolute
+count followed by the percentage within that actual-class row. The reporter
+expects the best epoch, training loss, and complete devel/test metrics and
+confusion matrices written by the trainer.
 
 ## Inference
 

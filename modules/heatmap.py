@@ -1,20 +1,16 @@
-# -*- coding: utf-8 -*-
-import click
-from concurrent.futures import ThreadPoolExecutor
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import click
+import cv2
 import torch
 import torch.nn as nn
-
+from pytorch_grad_cam.utils.image import show_cam_on_image
 from tqdm import tqdm
 
-from data_preprocessing import FITSDataset, get_data_loader
-from pytorch_grad_cam.utils.image import show_cam_on_image
-
-import kornia.augmentation as K
-
 from cnn import DRAGON, DRAGON_CUTOUT_SIZE
+from data_preprocessing import HDF5Dataset, get_data_loader
 from modules.batched_eigen_grad_cam import BatchedEigenGradCAM
 from utils import (
     asinh_normalize,
@@ -22,8 +18,6 @@ from utils import (
     load_model_state,
     normalization_kwargs_from_stats,
 )
-
-import cv2
 
 
 def _object_id_output_paths(dataset, output_dir):
@@ -197,8 +191,6 @@ def heatmap(
         for data in tqdm(loader):
             X, _ = data
             X = X.to(device, non_blocking=True)
-            if dataset.transform is not None:
-                X = dataset.transform(X)
             X = asinh_normalize(X, **normalization_kwargs)
 
             grayscale_cam = cam(input_tensor=X)
@@ -268,12 +260,6 @@ def heatmap(
               to use multiple GPUs when they are available""",
 )
 @click.option("--n-classes", type=int, default=6)
-@click.option(
-    "--crop/--no-crop",
-    default=True,
-    help="""If True, the images are passed through a cropping transformation
-to ensure proper cutout size""",
-)
 def main(
     model_path,
     output_dir,
@@ -285,7 +271,6 @@ def main(
     batch_size,
     n_workers,
     output_workers,
-    crop,
     n_classes,
 ):
 
@@ -304,18 +289,19 @@ def main(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # Transforming the dataset to the proper cutout size
-    T = None
-    if crop:
-        T = K.CenterCrop(cutout_size)
-
     # Load the data and create a loader.
     logging.info("Loading images to device...")
-    dataset = FITSDataset(
+    dataset = HDF5Dataset(
         data_dir,
-        transforms=T,
         load_labels=False
     )
+    expected_image_shape = (channels, cutout_size, cutout_size)
+    stored_image_shape = dataset.h5_image_shape[1:]
+    if stored_image_shape != expected_image_shape:
+        raise click.ClickException(
+            "Stored HDF5 image shape does not match the heatmap "
+            f"configuration: {stored_image_shape} != {expected_image_shape}"
+        )
 
     heatmap(
         model_path,

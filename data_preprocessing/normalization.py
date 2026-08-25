@@ -22,11 +22,6 @@ def _sample_h5_in_chunk_order(
     show_progress,
 ):
     """Sample an HDF5-backed dataset while reading each row chunk once."""
-    if not getattr(dataset, "use_h5", False):
-        return None
-    if getattr(dataset, "transform", None) is not None:
-        return None
-
     h5_path = getattr(dataset, "h5_path", None)
     h5_indices = getattr(dataset, "h5_indices", None)
     if h5_path is None or h5_indices is None:

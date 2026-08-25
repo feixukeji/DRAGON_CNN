@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader
 
-from .dataset import FITSDataset, preload_h5_images
+from .dataset import HDF5Dataset, preload_h5_images
 from .normalization import (
     compute_asinh_stats,
     save_asinh_stats,
@@ -41,9 +41,9 @@ def get_data_loader(
 
 
 __all__ = [
-    "FITSDataset",
-    "preload_h5_images",
-    "get_data_loader",
+    "HDF5Dataset",
     "compute_asinh_stats",
+    "get_data_loader",
+    "preload_h5_images",
     "save_asinh_stats",
 ]

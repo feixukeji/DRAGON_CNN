@@ -6,14 +6,13 @@ import logging
 from pathlib import Path
 
 import click
-import kornia.augmentation as K
 import pandas as pd
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 
 from cnn import DRAGON, DRAGON_CUTOUT_SIZE
-from data_preprocessing import FITSDataset, get_data_loader
+from data_preprocessing import HDF5Dataset, get_data_loader
 from utils import (
     asinh_normalize,
     discover_devices,
@@ -68,8 +67,6 @@ def predict(
     with torch.no_grad():
         for images, _labels in tqdm(loader, desc="Inference"):
             images = images.to(device)
-            if dataset.transform is not None:
-                images = dataset.transform(images)
             images = asinh_normalize(images, **normalization_kwargs)
             logits = model(images)
             probabilities.append(nn.functional.softmax(logits, dim=1))
@@ -117,7 +114,6 @@ def predict(
 @click.option("--n-workers", type=int, default=4)
 @click.option("--parallel/--no-parallel", default=True)
 @click.option("--n-classes", type=int, default=6)
-@click.option("--crop/--no-crop", default=True)
 @click.option("--labels/--no-labels", default=True)
 def main(
     model_path,
@@ -131,7 +127,6 @@ def main(
     n_workers,
     parallel,
     n_classes,
-    crop,
     labels,
 ):
     """Run label-free inference against DATA_DIR/info.csv."""
@@ -154,14 +149,23 @@ def main(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    transform = K.CenterCrop(cutout_size) if crop else None
-    dataset = FITSDataset(
+    dataset = HDF5Dataset(
         data_dir,
-        transforms=transform,
         load_labels=False,
     )
+    expected_image_shape = (channels, cutout_size, cutout_size)
+    stored_image_shape = dataset.h5_image_shape[1:]
+    if stored_image_shape != expected_image_shape:
+        raise click.ClickException(
+            "Stored HDF5 image shape does not match the inference "
+            f"configuration: {stored_image_shape} != {expected_image_shape}"
+        )
     catalog_path = Path(data_dir) / "info.csv"
-    catalog = pd.read_csv(catalog_path, dtype={"object_id": str})
+    catalog = pd.read_csv(
+        catalog_path,
+        dtype={"object_id": "string"},
+        low_memory=False,
+    )
     label_names = None
     if labels:
         labels_path = Path(labels_path)
