@@ -2,6 +2,7 @@ torch
 astropy
 numpy
 pandas
+matplotlib
 tqdm
 grad-cam
 opencv-python

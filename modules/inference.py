@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 import click
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -21,8 +22,10 @@ from utils import (
     normalization_kwargs_from_stats,
 )
 
+PREDICTION_FLOAT_FORMAT = "%.17g"
 
-def predict(
+
+def predict_probabilities(
     model_path,
     dataset,
     channels,
@@ -32,7 +35,7 @@ def predict(
     num_classes=6,
     normalization_kwargs=None,
 ):
-    """Return top-two labels and confidences for ``dataset``."""
+    """Return the complete softmax probability matrix for ``dataset``."""
     if not normalization_kwargs or not {
         "vmin",
         "vmax",
@@ -73,16 +76,64 @@ def predict(
 
     if not probabilities:
         raise ValueError("Inference dataset contains no rows")
-    probabilities = torch.cat(probabilities)
+    probabilities = torch.cat(probabilities).cpu()
     if probabilities.shape[1] < 2:
         raise ValueError("Inference requires a model with at least two classes")
-    values, indices = torch.topk(probabilities, 2, dim=1)
+    if probabilities.shape[1] != num_classes:
+        raise ValueError(
+            "Model output class count does not match the inference "
+            f"configuration: {probabilities.shape[1]} != {num_classes}"
+        )
+    return probabilities.numpy()
+
+
+def top_two_predictions(probabilities):
+    """Return top-two indices and values from an ``(N, C)`` probability array."""
+    probabilities = np.asarray(probabilities)
+    if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+        raise ValueError(
+            "Top-two prediction requires a two-dimensional probability array "
+            "with at least two classes"
+        )
+    if not np.all(np.isfinite(probabilities)):
+        raise ValueError("Probability array contains a non-finite value")
+
+    values, indices = torch.topk(torch.from_numpy(probabilities), 2, dim=1)
     return (
         indices[:, 0].cpu().numpy(),
         values[:, 0].cpu().numpy(),
         indices[:, 1].cpu().numpy(),
         values[:, 1].cpu().numpy(),
     )
+
+
+def write_predictions(frame, path):
+    """Write probabilities without changing float32 threshold comparisons."""
+    frame.to_csv(path, index=False, float_format=PREDICTION_FLOAT_FORMAT)
+
+
+def predict(
+    model_path,
+    dataset,
+    channels,
+    parallel=False,
+    batch_size=256,
+    n_workers=1,
+    num_classes=6,
+    normalization_kwargs=None,
+):
+    """Return top-two labels and confidences for ``dataset``."""
+    probabilities = predict_probabilities(
+        model_path,
+        dataset,
+        channels,
+        parallel=parallel,
+        batch_size=batch_size,
+        n_workers=n_workers,
+        num_classes=num_classes,
+        normalization_kwargs=normalization_kwargs,
+    )
+    return top_two_predictions(probabilities)
 
 
 @click.command()
@@ -115,6 +166,15 @@ def predict(
 @click.option("--parallel/--no-parallel", default=True)
 @click.option("--n-classes", type=int, default=6)
 @click.option("--labels/--no-labels", default=True)
+@click.option(
+    "--all-probabilities/--top-two-only",
+    default=False,
+    show_default=True,
+    help=(
+        "Also write probability__<class-index> columns for every class. "
+        "The default preserves the compact top-two output."
+    ),
+)
 def main(
     model_path,
     output_dir,
@@ -128,6 +188,7 @@ def main(
     parallel,
     n_classes,
     labels,
+    all_probabilities,
 ):
     """Run label-free inference against DATA_DIR/info.csv."""
     if channels <= 0 or n_classes < 2 or batch_size <= 0 or n_workers < 0:
@@ -177,7 +238,7 @@ def main(
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
 
-    predicted, confidence, second, second_confidence = predict(
+    probabilities = predict_probabilities(
         model_path,
         dataset,
         channels,
@@ -187,12 +248,18 @@ def main(
         num_classes=n_classes,
         normalization_kwargs=normalization_kwargs,
     )
+    predicted, confidence, second, second_confidence = top_two_predictions(
+        probabilities
+    )
 
     result = catalog.copy()
     result["predicted_labels"] = predicted
     result["predicted_confidence"] = confidence
     result["second_predicted_labels"] = second
     result["second_predicted_confidence"] = second_confidence
+    if all_probabilities:
+        for class_index in range(n_classes):
+            result[f"probability__{class_index}"] = probabilities[:, class_index]
     if label_names is not None:
         result["predicted_class"] = [label_names[int(index)] for index in predicted]
         result["second_predicted_class"] = [
@@ -202,7 +269,10 @@ def main(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = output_dir / "predictions.csv"
-    result.to_csv(prediction_path, index=False)
+    # Preserve float32 softmax values exactly when pandas reads the CSV back as
+    # float64. Calibrated thresholds may sit one float64 ULP above a tied score,
+    # so the usual shortened decimal representation can change a >= decision.
+    write_predictions(result, prediction_path)
     logging.info("Saved predictions to %s", prediction_path)
 
 

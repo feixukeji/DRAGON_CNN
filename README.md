@@ -3,7 +3,8 @@
 DRAGON (Data Reduced AGN + Galaxy Optical Network) is a PyTorch pipeline for
 multi-class classification of astronomical image cutouts. It covers the full
 workflow from multi-band FITS files to an aligned HDF5 dataset, reproducible
-data splits, training, evaluation, inference, and EigenGradCAM visualizations.
+data splits, training, evaluation, confidence calibration, inference, and
+EigenGradCAM visualizations.
 
 ## Features
 
@@ -17,7 +18,11 @@ data splits, training, evaluation, inference, and EigenGradCAM visualizations.
 - SGD and AdamW optimizers, balanced class weights, augmentation, gradient
   clipping, cosine learning-rate scheduling, and W&B logging.
 - Best-model selection on devel macro-F1 followed by a single test evaluation.
-- Top-2 inference, local metrics reports, and batched EigenGradCAM heatmaps.
+- Top-2 inference with optional all-class probability columns and stable score
+  serialization.
+- Local metrics reports and per-class confidence thresholds constrained by the
+  worst individual negative-class false-positive rate (FPR).
+- CSV confidence curves, diagnostic plots, and batched EigenGradCAM heatmaps.
 
 ## Workflow
 
@@ -40,27 +45,30 @@ training catalogs + FITS / pair-HDF5
                   v
          model.pt + best_metrics.json
                   |
-          +-------+--------+
-          |                |
-          v                v
-    predictions.csv   EigenGradCAM PNGs
+      +-----------+------+----------------+
+      |                  |                |
+      v                  v                v
+predictions.csv  confidence_curves  EigenGradCAM PNGs
 ~~~
 
 The examples keep dataset assets and experiment outputs separate.
 `labels.csv`, `normalization_stats.json`, split CSVs, and `tensors.h5` live in
 the dataset directory; `model.pt`, `best_metrics.json`, W&B files, predictions,
-and heatmaps live below an experiment directory.
+confidence-calibration artifacts, and heatmaps live below an experiment
+directory.
 
 ## Core contracts
 
 | Contract | Requirement |
 | --- | --- |
-| Image shape | Training, inference, and heatmaps accept `96 × 96` images. The channel count is configurable. |
+| Image shape | Training, calibration, inference, and heatmaps accept `96 × 96` images. The channel count is configurable. |
 | Channel order | Repeated `--bands` and `--band` options define tensor channel order. That positional order must match the normalization statistics and checkpoint; later stages receive only the channel count and cannot validate band semantics. |
-| Class mapping | `labels.csv`, `--n-classes`, and the checkpoint classifier head must describe the same classes in the same order. |
+| Class mapping | `labels.csv` defines the zero-based class order shared by `--n-classes`, the checkpoint classifier head, `probability__*` columns, and the threshold manifest. |
 | Row alignment | Every runtime metadata row contains one unique, in-range integer `h5_index` pointing into `tensors/tensors.h5`. |
-| Normalization | One `normalization_stats.json` is computed from the training split and reused without modification by training, inference, and heatmaps. |
+| Normalization | One `normalization_stats.json` is computed from the training split and reused without modification by training, calibration, inference, and heatmaps. |
 | Checkpoints | Model files are plain PyTorch `state_dict` mappings. Wrapped checkpoints and keys prefixed with `module.` are not accepted. |
+| Calibration split | Confidence calibration requires every class declared by `labels.csv` to occur in the selected labelled split. |
+| Threshold comparison | A class threshold applies to its matching `probability__<class-index>` column with a `>=` comparison. Independent class thresholds can accept zero, one, or multiple classes for one object. |
 | Experiment names | Reusing an experiment name replaces that experiment directory and everything below it. |
 
 ## Installation
@@ -90,8 +98,8 @@ To keep W&B data local, select offline mode before training:
 export WANDB_MODE=offline
 ~~~
 
-A CUDA GPU is strongly recommended for training and heatmap generation. CPU
-execution is supported but can be substantially slower.
+A CUDA GPU is strongly recommended for training, calibration, and heatmap
+generation. CPU execution is supported but can be substantially slower.
 
 ## Quick start
 
@@ -226,6 +234,23 @@ python -m train.train \
 
 The selected checkpoint and metrics are written to
 `/path/to/dragon_runs/baseline`.
+
+### 6. Calibrate per-class confidence thresholds
+
+Use the labelled devel split to generate confidence curves and choose one
+threshold per class at a target worst-negative-class FPR:
+
+~~~bash
+python -m scripts.evaluate_confidence_curves \
+  --model-path /path/to/dragon_runs/baseline/model.pt \
+  --data-dir /path/to/dragon_dataset \
+  --split-slug stratified \
+  --target-fpr 0.001
+~~~
+
+The default output directory is
+`/path/to/dragon_runs/baseline/confidence_curves`. It contains all-class
+softmax scores, tabular curve data, per-class thresholds, and diagnostic PNGs.
 
 ## Training catalog API
 
@@ -393,7 +418,8 @@ devel metrics, the final test metrics, and devel/test confusion matrices.
 
 > **Warning:** starting training with an existing `--experiment` name deletes
 > and recreates `<run-dir>/<experiment>` after input validation. This also
-> removes inference products stored below that experiment.
+> removes confidence-calibration artifacts and inference products stored below
+> that experiment.
 
 ## Transfer learning
 
@@ -458,6 +484,83 @@ Use `--labels /path/to/labels.csv` to override
 overall, macro, weighted, and per-class metrics plus confusion matrices shown
 as absolute counts and percentages of each actual-class row.
 
+## Confidence curves and threshold calibration
+
+The calibration command runs the selected labelled split through the model
+once and retains every softmax column. For each target class, it treats every
+other class as a separate negative population. A threshold is found for each
+negative class, then the strictest of those thresholds is selected. The result
+therefore constrains the empirical FPR for every individual negative class,
+not only for all negatives pooled together.
+
+~~~bash
+python -m scripts.evaluate_confidence_curves \
+  --model-path /path/to/dragon_runs/baseline/model.pt \
+  --data-dir /path/to/dragon_dataset \
+  --split-slug stratified \
+  --split devel \
+  --normalization-stats /path/to/dragon_dataset/normalization_stats.json \
+  --target-fpr 0.001 \
+  --batch-size 256 \
+  --curve-points 1001
+~~~
+
+`--split devel` and `--target-fpr 0.001` are the defaults. The label mapping is
+loaded from `DATA_DIR/labels.csv`, the channel count is inferred from the HDF5
+store, and normalization defaults to
+`DATA_DIR/normalization_stats.json`. Every declared class must have at least
+one row in the selected split. Prefer the devel split for calibration; using
+the test split to choose thresholds makes it part of model development rather
+than an untouched final holdout.
+
+For a negative class containing `N` rows, at most
+`floor(target_fpr × N)` rows may meet the threshold. Each per-negative-class
+threshold is placed immediately above its first disallowed score, so equal
+scores remain together under the manifest's `>=` comparison; the final class
+threshold is the maximum of those candidates. With small negative classes or
+a low target FPR, the allowed false-positive count can be zero.
+`--curve-points` controls only the resolution of the exported display curves;
+it does not approximate or alter the calibrated thresholds.
+
+Unless `--output-dir` is supplied, artifacts are written beside the checkpoint
+under `confidence_curves/`:
+
+~~~text
+confidence_curves/
+├── scores.csv
+├── curves.csv
+├── negative_class_fpr.csv
+├── thresholds.json
+├── FPR_curve.png
+├── Precision_curve.png
+├── Recall_curve.png
+├── F1_curve.png
+├── ROC_curve.png
+├── PR_curve.png
+└── classes/
+    └── class_<zero-padded-index>/
+        └── FPR_by_negative_class.png
+~~~
+
+`scores.csv` contains `object_id`, the true label and class name, and one
+`probability__<class-index>` column per class. `curves.csv` contains aggregate
+precision, recall/TPR, F1, pooled FPR, macro FPR, and worst-negative-class FPR
+over sampled thresholds, including the exact calibrated threshold.
+`negative_class_fpr.csv` breaks the FPR out by target and negative class.
+`thresholds.json` is the machine-readable manifest with provenance, label
+mapping, comparison rule, thresholds, counts, and achieved metrics.
+Plotting uses a non-interactive backend, so the command does not require a
+display server on batch or HPC nodes.
+
+Inference does not load `thresholds.json` or emit threshold-acceptance columns.
+Run it with `--all-probabilities`, then apply each
+`classes.<class-name>.threshold` value to the probability column with the same
+numeric class index. For example, a class whose mapping value is `2` is tested
+as `probability__2 >= threshold`. These one-vs-rest gates are independent of
+the top-1 decision, so an object can pass no class or more than one class. The
+reported rates are empirical measurements of the selected calibration split,
+not guarantees for future data.
+
 ## Inference
 
 Inference has two stages: build an HDF5 catalog and run prediction. Keep each
@@ -501,7 +604,8 @@ python -m modules.inference \
   --cutout-size 96 \
   --channels 3 \
   --n-classes 3 \
-  --batch-size 256
+  --batch-size 256 \
+  --all-probabilities
 ~~~
 
 The output `predictions.csv` contains the aligned catalog columns plus:
@@ -514,11 +618,16 @@ The output `predictions.csv` contains the aligned catalog columns plus:
 | `second_predicted_confidence` | Top-2 softmax probability. |
 | `predicted_class` | Top-1 class name when labels are enabled. |
 | `second_predicted_class` | Top-2 class name when labels are enabled. |
+| `probability__<class-index>` | Softmax probability for that numeric class when `--all-probabilities` is selected. |
 
 Use `--no-labels` and omit `--labels-path` to produce numeric indices only.
-Inference streams HDF5 batches instead of preloading the entire tensor store.
-When multiple CUDA devices are available, `--parallel` allows inference to use
-`DataParallel`.
+The default `--top-two-only` mode omits the full probability columns while
+retaining the four top-2 columns. Probability values are written with enough
+decimal precision to preserve the model's float32 scores when pandas reads the
+CSV as float64; this keeps `>=` comparisons against calibrated thresholds
+stable. Inference streams HDF5 batches instead of preloading the entire tensor
+store. When multiple CUDA devices are available, `--parallel` allows inference
+to use `DataParallel`.
 
 ## EigenGradCAM heatmaps
 
@@ -564,7 +673,8 @@ Every command provides full option documentation through `--help`:
 | `python -m train.train` | Train from scratch or perform gradual transfer learning. |
 | `python -m scripts.convert_model_channels` | Adapt checkpoint input channels and classifier size. |
 | `python -m scripts.report_training_results` | Print metrics from one experiment or run root. |
-| `python -m modules.inference` | Write top-2 predictions for an inference catalog. |
+| `python -m scripts.evaluate_confidence_curves` | Export all-class confidence curves and calibrate worst-negative-class FPR thresholds. |
+| `python -m modules.inference` | Write top-2 predictions and optionally every class probability for an inference catalog. |
 | `python -m modules.heatmap` | Generate batched EigenGradCAM overlays. |
 
 `prepare_training_catalog` is an integration API rather than a command-line
@@ -578,6 +688,6 @@ entry point.
 | `data_preprocessing/` | Catalog validation, FITS/HDF5 assembly, datasets, splits, normalization, and inference preparation. |
 | `train/` | Training orchestration, Ignite trainers, model selection, and gradual unfreezing. |
 | `modules/` | Inference and device-native batched EigenGradCAM generation. |
-| `scripts/` | Checkpoint conversion and local metrics reporting. |
+| `scripts/` | Checkpoint conversion, local metrics reporting, and confidence calibration. |
 | `utils/` | Device selection, label/checkpoint validation, optimizers, and tensor normalization. |
 | `requirements.txt` | Unpinned Python runtime dependencies. |
