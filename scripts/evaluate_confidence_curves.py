@@ -53,8 +53,6 @@ from utils import (
 )
 
 
-SCHEMA_VERSION = 1
-ARTIFACT_TYPE = "dragon_confidence_thresholds"
 PROBABILITY_COLUMN_PREFIX = "probability__"
 
 
@@ -502,7 +500,7 @@ def build_manifest(
     target_fpr: float,
     calibrations: dict[int, ClassThreshold],
 ) -> dict[str, object]:
-    """Create the stable threshold-manifest payload consumed downstream."""
+    """Create the threshold-manifest payload consumed downstream."""
     classes: dict[str, object] = {}
     for class_index, class_name in label_names.items():
         calibration = calibrations[class_index]
@@ -554,12 +552,8 @@ def build_manifest(
 
     resolved_data_dir = data_dir.resolve()
     return {
-        "schema_version": SCHEMA_VERSION,
-        "artifact_type": ARTIFACT_TYPE,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "target_fpr": target_fpr,
-        "fpr_aggregation": "worst_class",
-        "comparison": ">=",
         "model": {
             "path": str(model_path.resolve()),
         },

@@ -548,7 +548,7 @@ precision, recall/TPR, F1, pooled FPR, macro FPR, and worst-negative-class FPR
 over sampled thresholds, including the exact calibrated threshold.
 `negative_class_fpr.csv` breaks the FPR out by target and negative class.
 `thresholds.json` is the machine-readable manifest with provenance, label
-mapping, comparison rule, thresholds, counts, and achieved metrics.
+mapping, thresholds, counts, and achieved metrics.
 Plotting uses a non-interactive backend, so the command does not require a
 display server on batch or HPC nodes.
 
