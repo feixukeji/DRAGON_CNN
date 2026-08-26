@@ -15,17 +15,6 @@ from .catalog_validation import (
     require_unique_object_ids,
 )
 
-DRAGON_CLASS_ORDER = (
-    "rubbish",
-    "empty",
-    "single_galaxy",
-    "single_star",
-    "single_agn",
-    "agn_galaxy",
-    "merger",
-    "agn_star",
-    "dual_agn",
-)
 TENSOR_STORE_COLUMN = "tensor_store"
 TENSOR_INDEX_COLUMN = "tensor_index"
 TENSOR_OBJECT_ID_COLUMN = "tensor_object_id"
@@ -176,7 +165,7 @@ def prepare_training_catalog(
     class_specs: Sequence[ClassSpec],
     bands: Sequence[str],
     output_dir: Path | str,
-    class_order: Sequence[str] = DRAGON_CLASS_ORDER,
+    class_order: Sequence[str],
     coordinate_tolerance_arcsec: float = DEFAULT_COORDINATE_TOLERANCE_ARCSEC,
     filter_coordinate_equivalent_duplicates: bool = True,
     context: str = "DRAGON training",
@@ -184,14 +173,15 @@ def prepare_training_catalog(
 ) -> PreparedTrainingCatalog:
     """Write ``raw_info.csv`` and ``labels.csv`` for DRAGON training.
 
-    Band names are used exactly as supplied. FITS-backed classes derive one
-    path per band from ``cutout_dir``; tensor-backed classes preserve the
+    ``class_order`` is required and determines the zero-based mapping written
+    to ``labels.csv``. It must contain every class specification name exactly
+    once. Band names are used exactly as supplied. FITS-backed classes derive
+    one path per band from ``cutout_dir``; tensor-backed classes preserve the
     catalog's ``tensor_store`` and ``tensor_index`` reference. An existing
     ``split`` column is preserved for tensor-backed rows. When supplied,
     ``split_assignments`` is authoritative for every FITS-backed row. Every
-    catalog must contain ``object_id``. Catalogs with
-    both ``ra`` and ``dec`` participate in coordinate-based duplicate
-    filtering when enabled.
+    catalog must contain ``object_id``. Catalogs with both ``ra`` and ``dec``
+    participate in coordinate-based duplicate filtering when enabled.
     """
     specs = list(class_specs)
     ordered_classes = list(class_order)
