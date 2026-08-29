@@ -12,7 +12,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 
-from cnn import DRAGON, DRAGON_CUTOUT_SIZE, model_stats
+from cnn import (
+    DRAGON,
+    DRAGON_CUTOUT_SIZE,
+    DRAGON_MIN_SIZE,
+    DRAGON_SIZE_DIVISOR,
+    model_stats,
+)
 from data_preprocessing import (
     HDF5Dataset,
     get_data_loader,
@@ -140,9 +146,28 @@ class RandomDihedralAugmentation(nn.Module):
         "splits/<slug>-devel.csv, and splits/<slug>-test.csv."
     ),
 )
-@click.option("--cutout-size", type=int, default=96, show_default=True)
-@click.option("--channels", type=int, default=1)
-@click.option("--n-classes", type=int, default=6)
+@click.option(
+    "--cutout-size",
+    type=int,
+    default=DRAGON_CUTOUT_SIZE,
+    show_default=True,
+    help=(
+        f"Cutout side length; must be a multiple of {DRAGON_SIZE_DIVISOR} "
+        f"and at least {DRAGON_MIN_SIZE}."
+    ),
+)
+@click.option(
+    "--channels",
+    type=int,
+    required=True,
+    help="Input band count; must match the stored cutouts.",
+)
+@click.option(
+    "--n-classes",
+    type=int,
+    required=True,
+    help="Output class count; must match labels.csv.",
+)
 @click.option(
     "--n-workers",
     type=int,
@@ -235,9 +260,12 @@ def train(**kwargs):
 
     if not args["train"] and not args["model_state"]:
         raise click.UsageError("Transfer learning requires --model-state.")
-    if args["cutout_size"] != DRAGON_CUTOUT_SIZE:
+    cutout_size = args["cutout_size"]
+    if cutout_size % DRAGON_SIZE_DIVISOR or cutout_size < DRAGON_MIN_SIZE:
         raise click.BadParameter(
-            f"DRAGON requires {DRAGON_CUTOUT_SIZE}x{DRAGON_CUTOUT_SIZE} inputs",
+            "DRAGON halves the map four times, so the cutout side length must "
+            f"be a multiple of {DRAGON_SIZE_DIVISOR} and at least "
+            f"{DRAGON_MIN_SIZE}",
             param_hint="--cutout-size",
         )
 

@@ -20,7 +20,12 @@ from .normalization import compute_asinh_stats, save_asinh_stats
 )
 @click.option("--split-slug", type=str, required=True)
 @click.option("--split", type=str, default="train", show_default=True)
-@click.option("--channels", type=int, default=1, show_default=True)
+@click.option(
+    "--channels",
+    type=int,
+    required=True,
+    help="Input band count; must match the stored cutouts.",
+)
 @click.option(
     "--low-pct", type=float, default=DEFAULT_LOW_PERCENTILE, show_default=True
 )

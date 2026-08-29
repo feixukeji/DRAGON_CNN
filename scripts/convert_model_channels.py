@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 from __future__ import annotations
 
 import argparse
@@ -7,11 +6,16 @@ from pathlib import Path
 
 import torch
 
+from cnn import (
+    DRAGON_CLASSIFIER_BIAS_KEY,
+    DRAGON_CLASSIFIER_WEIGHT_KEY,
+    DRAGON_FIRST_CONV_WEIGHT_KEY,
+)
 from utils.model_utils import load_plain_state_dict
 
 
 def _find_conv_key(state_dict: dict[str, torch.Tensor]) -> str:
-    key = "layer1.0.weight"
+    key = DRAGON_FIRST_CONV_WEIGHT_KEY
     if key not in state_dict:
         raise KeyError(f"DRAGON checkpoint is missing {key!r}")
     return key
@@ -42,8 +46,8 @@ def _adapt_conv_weight(weight: torch.Tensor, target_channels: int) -> torch.Tens
 def _find_classifier_pairs(
     state_dict: dict[str, torch.Tensor],
 ) -> list[tuple[str, str]]:
-    weight_key = "fc2.weight"
-    bias_key = "fc2.bias"
+    weight_key = DRAGON_CLASSIFIER_WEIGHT_KEY
+    bias_key = DRAGON_CLASSIFIER_BIAS_KEY
     if weight_key not in state_dict or bias_key not in state_dict:
         raise KeyError(
             f"DRAGON checkpoint must contain {weight_key!r} and {bias_key!r}"

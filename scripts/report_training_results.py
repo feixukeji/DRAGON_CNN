@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Report metrics stored in experiment-level ``best_metrics.json`` files.
 
 Examples::

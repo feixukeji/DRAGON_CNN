@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Calibrate class confidence thresholds from a labelled dataset split.
 
 The command performs one model pass, retains every softmax column, and then
@@ -42,7 +41,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from cnn import DRAGON, DRAGON_CUTOUT_SIZE
+from cnn import DRAGON, DRAGON_MIN_SIZE, DRAGON_SIZE_DIVISOR
 from data_preprocessing import HDF5Dataset, get_data_loader
 from utils import (
     asinh_normalize,
@@ -860,9 +859,14 @@ def main(
 
     stored_shape = dataset.h5_image_shape[1:]
     channels, height, width = stored_shape
-    if (height, width) != (DRAGON_CUTOUT_SIZE, DRAGON_CUTOUT_SIZE):
+    if (
+        height % DRAGON_SIZE_DIVISOR
+        or width % DRAGON_SIZE_DIVISOR
+        or min(height, width) < DRAGON_MIN_SIZE
+    ):
         raise click.ClickException(
-            "Stored HDF5 cutout shape is incompatible with DRAGON: "
+            "Stored HDF5 cutout side lengths must be multiples of "
+            f"{DRAGON_SIZE_DIVISOR} and at least {DRAGON_MIN_SIZE}: "
             f"{stored_shape}"
         )
     try:

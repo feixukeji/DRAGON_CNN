@@ -8,7 +8,11 @@ EigenGradCAM visualizations.
 
 ## Features
 
-- An eight-block convolutional network for fixed `96 × 96` cutouts.
+- An eight-block residual convolutional network with anti-aliased
+  downsampling and a global-average-pooled head; input side lengths only
+  have to be multiples of 16, from 32 upward.
+- `--channels` and `--n-classes` are required wherever a model is built, so a
+  default can never silently disagree with the cutouts or with `labels.csv`.
 - Configurable input channels and output classes.
 - Parallel FITS ingestion with center cropping or zero padding.
 - Optional ingestion of rows from compatible pair-HDF5 tensor stores.
@@ -61,7 +65,7 @@ directory.
 
 | Contract | Requirement |
 | --- | --- |
-| Image shape | Training, calibration, inference, and heatmaps accept `96 × 96` images. The channel count is configurable. |
+| Image shape | Side lengths must be multiples of 16 and at least 32, because the network halves the map four times and the last stage still has to pad its map by one; `96 × 96` is the default everywhere. The channel count is configurable. |
 | Channel order | Repeated `--bands` and `--band` options define tensor channel order. That positional order must match the normalization statistics and checkpoint; later stages receive only the channel count and cannot validate band semantics. |
 | Class mapping | `labels.csv` defines the zero-based class order shared by `--n-classes`, the checkpoint classifier head, `probability__*` columns, and the threshold manifest. |
 | Row alignment | Every runtime metadata row contains one unique, in-range integer `h5_index` pointing into `tensors/tensors.h5`. |
@@ -319,18 +323,39 @@ runtime metadata after `h5_index` is assigned.
 
 ## Model
 
-DRAGON accepts `(batch, channels, 96, 96)` tensors. Its feature extractor
-contains eight `Conv2d → BatchNorm2d → LeakyReLU → AvgPool2d` blocks with
-output widths:
+DRAGON accepts `(batch, channels, H, W)` tensors. `H` and `W` must be
+multiples of 16 and at least 32, because the feature extractor halves the map
+four times and the last stage still has to pad its map by one. The
+global-average-pooled head carries no size-dependent weights, so one
+architecture serves every such size; `96 × 96` is the default and the size the
+block table below describes.
+
+The extractor is eight blocks, `layer1` through `layer8`. Odd-numbered stages
+after the first are `ResidualBlock`s (two `3×3` convolutions on an identity
+shortcut); the rest are `Conv2d → BatchNorm2d → LeakyReLU`, each preceded from
+`layer2` onward by a `MaxBlurPool2d` that halves the map. Widths and map sizes:
 
 ~~~text
-64 → 96 → 128 → 256 → 384 → 384 → 384 → 512
+layer1  48 @ 96×96               layer5  128 @ 24×24   (residual)
+layer2  64 @ 48×48               layer6  256 @ 12×12
+layer3  64 @ 48×48   (residual)  layer7  256 @ 12×12   (residual)
+layer4 128 @ 24×24               layer8  512 @  6×6
 ~~~
 
-The final `512 × 2 × 2` feature map is flattened and passed through a
-`2048 → 1024` fully connected layer, LeakyReLU, dropout with probability
-`0.5`, and the output classifier. A three-channel, six-class instance has
-7,881,894 parameters.
+`MaxBlurPool2d` is an anti-aliased downsample: a stride-1 `2×2` max, then a
+reflection-padded binomial blur subsampled by 2. Average pooling would erase
+the saddle between two close PSFs, which is the feature that separates a pair
+from a single source; plain strided max pooling keeps the peak but aliases it.
+The blur samples an even-sized map symmetrically, so the eight dihedral
+training augmentations stay equivalent views of the same object.
+
+Residual blocks apply no activation after the sum, and `bn2.weight` is zeroed
+at initialization, so each block starts as exactly the identity.
+
+The `512 × 6 × 6` feature map is global-average-pooled to `512`, passed through
+dropout with probability `0.5`, and classified by a single `Linear` layer. A
+three-channel, six-class instance has 3,132,406 parameters and costs about
+713 MMAC per `96 × 96` image.
 
 ## Training behavior
 
@@ -457,8 +482,8 @@ python -m train.train \
   --lr0 2e-5
 ~~~
 
-Transfer learning initially trains `fc1` and `fc2` while all convolutional
-blocks are frozen. After the warmup, complete blocks are unfrozen from
+Transfer learning initially trains only the `classifier` head while all eight
+`layerN` blocks are frozen. After the warmup, complete blocks are unfrozen from
 `layer8` toward `layer1`. Frozen blocks remain in evaluation mode so their
 BatchNorm parameters and running statistics do not change.
 

@@ -9,7 +9,12 @@ import torch.nn as nn
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from tqdm import tqdm
 
-from cnn import DRAGON, DRAGON_CUTOUT_SIZE
+from cnn import (
+    DRAGON,
+    DRAGON_CUTOUT_SIZE,
+    DRAGON_MIN_SIZE,
+    DRAGON_SIZE_DIVISOR,
+)
 from data_preprocessing import HDF5Dataset, get_data_loader
 from modules.batched_eigen_grad_cam import BatchedEigenGradCAM
 from utils import (
@@ -230,8 +235,22 @@ def heatmap(
     type=click.Path(exists=True, file_okay=False),
     required=True,
 )
-@click.option("--cutout-size", type=int, default=96, show_default=True)
-@click.option("--channels", type=int, default=3)
+@click.option(
+    "--cutout-size",
+    type=int,
+    default=DRAGON_CUTOUT_SIZE,
+    show_default=True,
+    help=(
+        f"Cutout side length; must be a multiple of {DRAGON_SIZE_DIVISOR} "
+        f"and at least {DRAGON_MIN_SIZE}."
+    ),
+)
+@click.option(
+    "--channels",
+    type=int,
+    required=True,
+    help="Input band count; must match the checkpoint and the cutouts.",
+)
 @click.option(
     "--normalization-stats",
     type=click.Path(exists=True, dir_okay=False),
@@ -259,7 +278,12 @@ def heatmap(
     help="""The parallel argument controls whether or not
               to use multiple GPUs when they are available""",
 )
-@click.option("--n-classes", type=int, default=6)
+@click.option(
+    "--n-classes",
+    type=int,
+    required=True,
+    help="Output class count; must match the checkpoint and labels.csv.",
+)
 def main(
     model_path,
     output_dir,
@@ -274,9 +298,11 @@ def main(
     n_classes,
 ):
 
-    if cutout_size != DRAGON_CUTOUT_SIZE:
+    if cutout_size % DRAGON_SIZE_DIVISOR or cutout_size < DRAGON_MIN_SIZE:
         raise click.BadParameter(
-            f"DRAGON requires {DRAGON_CUTOUT_SIZE}x{DRAGON_CUTOUT_SIZE} inputs",
+            "DRAGON halves the map four times, so the cutout side length must "
+            f"be a multiple of {DRAGON_SIZE_DIVISOR} and at least "
+            f"{DRAGON_MIN_SIZE}",
             param_hint="--cutout-size",
         )
 
