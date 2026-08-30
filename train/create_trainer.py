@@ -56,7 +56,7 @@ class GradualBackboneUnfreezer:
         if not blocks:
             raise ValueError("Transfer learning requires backbone blocks named layerN.")
 
-        # Unfreeze from the task-specific end of the backbone toward the input.
+        # Unfreeze from the output side toward the input.
         self._frozen_blocks = sorted(
             blocks, key=lambda item: int(item[0].removeprefix("layer")), reverse=True
         )
@@ -64,7 +64,7 @@ class GradualBackboneUnfreezer:
         for name, module in self._frozen_blocks:
             for parameter in module.parameters():
                 parameter.requires_grad = False
-            # model.train() would otherwise keep updating frozen BatchNorm buffers.
+            # Keep frozen BatchNorm buffers fixed when model.train() is called.
             self._eval_hooks[name] = module.register_forward_pre_hook(
                 self._force_eval
             )
@@ -149,15 +149,12 @@ def create_trainer(
         amp_mode = "amp"
         logging.info("Using CUDA BF16 automatic mixed precision.")
 
-    # 1. Define the custom batch preparation function
     def custom_prepare_batch(batch, device, non_blocking, transforms):
         x, y = batch
 
-        # Images were normalized once during the full HDF5 preload.
         x = x.to(device, non_blocking=non_blocking)
         y = y.to(device, non_blocking=non_blocking)
 
-        # Apply transformations on the GPU to the whole batch (B, C, H, W)
         if transforms is not None:
             if hasattr(transforms, "__len__"):
                 for transform in transforms:
@@ -173,7 +170,6 @@ def create_trainer(
     def prepare_eval_batch(batch, device, non_blocking):
         return custom_prepare_batch(batch, device, non_blocking, None)
 
-    # 2. Pass the custom function to the trainer
     trainer = create_supervised_trainer(
         model, optimizer, criterion, device=device,
         prepare_batch=prepare_train_batch,
@@ -189,12 +185,10 @@ def create_trainer(
             "Clipping the global gradient L2 norm to max_norm=%g before each optimizer step.",
             max_grad_norm,
         )
-        # Keep the removable hook handle with the trainer that owns it.
         trainer.gradient_clip_handle = gradient_clip_handle
 
     pbar = ProgressBar(persist=False)
 
-    # Attach it to the trainer.
     pbar.attach(trainer, output_transform=lambda x: {'batch_loss': x})
 
     if use_scheduler:
@@ -251,7 +245,6 @@ def create_trainer(
     def evaluate_metrics(loader, split):
         logging.info("Evaluating %s metrics.", split)
 
-        # Reset evaluator state before running evaluation
         evaluator.state.metrics = {}
 
         evaluator.run(loader)
@@ -270,7 +263,6 @@ def create_trainer(
     def get_current_lr(optimizer):
         return optimizer.param_groups[0]['lr']
 
-    # Define training hooks
     if use_scheduler:
         trainer.add_event_handler(Events.ITERATION_STARTED, scheduler)
 
@@ -376,8 +368,7 @@ def create_trainer(
         )
         load_model_state(model, model_path, device=device)
 
-        # The test split is intentionally hidden from model selection and is
-        # evaluated exactly once, after restoring the devel-selected model.
+        # Evaluate test once after restoring the devel-selected model.
         test_metrics, test_confusion_matrix = evaluate_metrics(
             loaders["test"],
             "test",
@@ -397,8 +388,7 @@ def create_trainer(
             "metrics": best_state["metrics"],
             "confusion_matrices": best_state["confusion_matrices"],
         }
-        # Best-model and final-test results are run outputs, not another epoch.
-        # Log only their rich charts; scalar results live exclusively in summary.
+        # Keep final scalars in the summary rather than epoch history.
         wandb_run.log(
             {
                 "best/devel/confusion_matrix": confusion_matrix_plot(
@@ -460,7 +450,6 @@ def create_transfer_learner(
         unfreeze_warmup_epochs,
     )
 
-    # Create trainer
     trainer = create_trainer(
         model,
         optimizer,
@@ -481,7 +470,6 @@ def create_transfer_learner(
         for block_name in unfreezer.unfreeze_next(unfreeze_blocks_per_epoch):
             logging.info("Unfroze backbone block %s before epoch 1.", block_name)
 
-    # Unfreeze complete blocks after the configured head-only warmup.
     reported_all_trainable = False
 
     @trainer.on(Events.EPOCH_COMPLETED)

@@ -72,9 +72,7 @@ def _object_id_output_paths(dataset, output_dir):
 
 def _render_and_save_heatmap(img_tensor, grayscale_cam, save_file, channels):
     """Create and save one overlay; safe to run in a worker thread."""
-    # Handle 3-channel i/r/g input as RGB vs 1-channel fallback.
     if channels == 3:
-        # Channels are already ordered as i/r/g -> R/G/B.
         img_bg = img_tensor.transpose(1, 2, 0)
         img_normalized = (
             (img_bg - img_bg.min())
@@ -130,8 +128,7 @@ def heatmap(
         num_classes=6,
         normalization_kwargs=None,
 ):
-    """Using the model defined in model path, return the output values for
-    the given set of images"""
+    """Generate one EigenGradCAM overlay per dataset row."""
 
     if output_workers < 1:
         raise ValueError("output_workers must be at least 1.")
@@ -145,7 +142,6 @@ def heatmap(
             "normalization_stats.json"
         )
 
-    # Discover devices
     device = discover_devices()
 
     model_args = {
@@ -154,15 +150,12 @@ def heatmap(
     }
     model = DRAGON(**model_args)
 
-    # Load the model
     logging.info("Loading model...")
     load_model_state(model, model_path, device=device)
     model = model.to(device)
 
-    # Set to evaluation mode
     model.eval()
 
-    # Create a data_preprocessing loader
     loader = get_data_loader(
         dataset,
         batch_size=batch_size,
@@ -170,8 +163,7 @@ def heatmap(
         shuffle=False,
     )
 
-    # layer3 runs at stride 4 with a 56 px receptive field, which is the scale
-    # the separation lives on; layer4 has already pooled it away.
+    # layer3 retains pair-scale spatial detail.
     target_layer = model.layer3
 
     output_dir = Path(output_dir)
@@ -196,9 +188,7 @@ def heatmap(
 
             grayscale_cam = cam(input_tensor=X)
 
-            # Move the whole batch to CPU once, then render/write each PNG in
-            # parallel. Waiting per batch bounds memory use and surfaces errors
-            # before more GPU work is started.
+            # Wait per batch to bound host memory and surface write failures.
             image_batch = X.detach().cpu().numpy()
             grayscale_cam = grayscale_cam.cpu().numpy()
             batch_end = global_img_idx + len(image_batch)
@@ -304,7 +294,6 @@ def main(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # Load the data and create a loader.
     logging.info("Loading images to device...")
     dataset = HDF5Dataset(
         data_dir,

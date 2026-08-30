@@ -318,9 +318,8 @@ class HDF5Dataset(Dataset):
         self.h5_images = images
 
     def _lazy_init_h5(self):
-        """Initializes the HDF5 file lazily when a PyTorch background worker asks for it."""
+        """Open the HDF5 store on first access in each worker."""
         if self.h5_images is None:
-            # swmr=True enables Single-Writer Multiple-Reader, which is ideal for PyTorch DataLoaders
             self.h5_file = h5py.File(self.h5_path, 'r', swmr=True, rdcc_nbytes=1024 ** 2 * 512)
             self.h5_images = self.h5_file[H5_IMAGES_NAME]
 
@@ -349,7 +348,7 @@ class HDF5Dataset(Dataset):
         return len(self.labels)
 
     def __del__(self):
-        """Gracefully close the HDF5 file handle upon garbage collection."""
+        """Close the HDF5 handle during cleanup."""
         if getattr(self, "h5_file", None) is not None:
             try:
                 self.h5_file.close()

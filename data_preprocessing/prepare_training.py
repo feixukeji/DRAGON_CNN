@@ -171,17 +171,10 @@ def prepare_training_catalog(
     context: str = "DRAGON training",
     split_assignments: Mapping[str, str] | None = None,
 ) -> PreparedTrainingCatalog:
-    """Write ``raw_info.csv`` and ``labels.csv`` for DRAGON training.
+    """Write aligned ``raw_info.csv`` and zero-based ``labels.csv`` files.
 
-    ``class_order`` is required and determines the zero-based mapping written
-    to ``labels.csv``. It must contain every class specification name exactly
-    once. Band names are used exactly as supplied. FITS-backed classes derive
-    one path per band from ``cutout_dir``; tensor-backed classes preserve the
-    catalog's ``tensor_store`` and ``tensor_index`` reference. An existing
-    ``split`` column is preserved for tensor-backed rows. When supplied,
-    ``split_assignments`` is authoritative for every FITS-backed row. Every
-    catalog must contain ``object_id``. Catalogs with both ``ra`` and ``dec``
-    participate in coordinate-based duplicate filtering when enabled.
+    Supports FITS- and tensor-backed classes, optional split assignments, and
+    coordinate-based duplicate filtering.
     """
     specs = list(class_specs)
     ordered_classes = list(class_order)

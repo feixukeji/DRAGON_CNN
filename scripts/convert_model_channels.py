@@ -58,20 +58,9 @@ def _adapt_head(
     target_classes: int | None,
     seed: int,
 ) -> list[str]:
-    """Rebuild the head when the checkpoint's no longer fits the architecture.
+    """Rebuild the complete head if any expected tensor is missing or mismatched.
 
-    The backbone transfers whenever its shapes still match, but the head does
-    not survive a change in class count, in the statistics the taps emit, or in
-    how the head is built -- and only the first of those shows up in the output
-    layer. Patching that layer in place, which is what this script used to do,
-    silently keeps a stale feature width and fails much later at load. So the
-    unit of replacement is every parameter under ``DRAGON_HEAD_PREFIXES``, and
-    it is replaced only when at least one of them actually mismatches, so an
-    unchanged head keeps its trained weights.
-
-    The replacements come from ``DRAGON._initialize_weights`` rather than from a
-    rule restated here, and ``seed`` is set first, so the converted head is
-    reproducible from the same source checkpoint.
+    New parameters use the model's seeded initialization.
     """
     if target_classes is not None and target_classes <= 0:
         raise ValueError("target_classes must be positive")

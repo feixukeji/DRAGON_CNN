@@ -1,10 +1,4 @@
-"""Calibrate class confidence thresholds from a labelled dataset split.
-
-The command performs one model pass, retains every softmax column, and then
-computes one-vs-rest confidence curves for every class declared by
-``labels.csv``.  Thresholds are calibrated against the worst individual
-negative class rather than the pooled negative population.
-"""
+"""Build confidence curves and worst-negative-class FPR thresholds."""
 
 from __future__ import annotations
 
@@ -18,10 +12,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 
-# Batch/HPC nodes frequently have neither a display nor a writable home
-# directory.  Configure matplotlib before importing pyplot and give its cache a
-# private, automatically cleaned temporary directory unless the caller already
-# selected one.
+# Configure headless plotting and a temporary cache before importing pyplot.
 os.environ.setdefault("MPLBACKEND", "Agg")
 _MPL_CONFIG_TMPDIR = None
 if "MPLCONFIGDIR" not in os.environ:
@@ -110,12 +101,7 @@ def threshold_for_group_fpr(
     negative_scores: np.ndarray,
     target_fpr: float,
 ) -> tuple[float, int]:
-    """Find a tie-safe ``>=`` threshold for one negative population.
-
-    The returned threshold is the float64 value immediately above the first
-    disallowed score.  Consequently tied scores are always accepted or
-    rejected together.
-    """
+    """Return a ``>=`` threshold that keeps tied scores together."""
     target_fpr = _validate_target_fpr(target_fpr)
     scores = np.asarray(negative_scores, dtype=np.float64)
     if scores.ndim != 1 or scores.size == 0:
@@ -185,8 +171,7 @@ def calibrate_worst_class_threshold(
             allowed,
         )
 
-    # Enforcing every per-negative-class constraint is equivalent to taking
-    # the maximum of their independently calibrated thresholds.
+    # The strictest per-class threshold satisfies every constraint.
     threshold = max(item[1] for item in provisional.values())
     per_negative: dict[int, NegativeClassThreshold] = {}
     total_false_positives = 0
@@ -199,9 +184,7 @@ def calibrate_worst_class_threshold(
         false_positives = _count_at_or_above(negative_scores, threshold)
         n_negative = int(negative_scores.size)
         empirical_fpr = false_positives / n_negative
-        # Compare integer counts here: ``allowed`` is the exact finite-sample
-        # constraint, whereas comparing two rounded binary floats can report a
-        # spurious violation when the empirical FPR lies exactly on the limit.
+        # Integer counts avoid rounding at the exact finite-sample limit.
         if false_positives > allowed:
             raise AssertionError(
                 "Internal error: calibrated threshold violates a negative-class "
@@ -476,9 +459,7 @@ def _write_scores(
         result[f"{PROBABILITY_COLUMN_PREFIX}{class_index}"] = probabilities[
             :, class_index
         ]
-    # Preserve the exact float32 score when pandas later reads it as float64.
-    # A short decimal representation can round to the other side of a
-    # float64-nextafter threshold and invalidate the documented >= rule.
+    # Full precision preserves comparisons against tie-safe thresholds.
     result.to_csv(path, index=False, float_format="%.17g")
 
 

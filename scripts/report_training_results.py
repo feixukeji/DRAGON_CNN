@@ -1,10 +1,4 @@
-"""Report metrics stored in experiment-level ``best_metrics.json`` files.
-
-Examples::
-
-    python -m scripts.report_training_results /path/to/dragon_runs
-    python -m scripts.report_training_results /path/to/dragon_runs/dragon
-"""
+"""Report metrics from experiment-level ``best_metrics.json`` files."""
 
 from __future__ import annotations
 

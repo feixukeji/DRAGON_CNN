@@ -143,11 +143,9 @@ def compute_asinh_stats(
     seed=42,
     show_progress=True,
 ):
-    """Estimate per-channel percentiles from a dataset using bounded sampling.
+    """Estimate per-channel percentiles with bounded, per-cutout sampling.
 
-    Sampling is balanced across cutouts, like Euclid's per-image sampling, and
-    the global cap prevents large training sets from exhausting host memory.
-    ``max_samples_per_channel=0`` disables the global cap.
+    Set ``max_samples_per_channel=0`` to disable the global cap.
     """
     if not 0.0 <= low_pct < high_pct <= 100.0:
         raise ValueError("Percentiles must satisfy 0 <= low_pct < high_pct <= 100.")

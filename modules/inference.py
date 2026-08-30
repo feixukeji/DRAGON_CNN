@@ -287,9 +287,7 @@ def main(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = output_dir / "predictions.csv"
-    # Preserve float32 softmax values exactly when pandas reads the CSV back as
-    # float64. Calibrated thresholds may sit one float64 ULP above a tied score,
-    # so the usual shortened decimal representation can change a >= decision.
+    # Full precision preserves comparisons against tie-safe thresholds.
     write_predictions(result, prediction_path)
     logging.info("Saved predictions to %s", prediction_path)
 

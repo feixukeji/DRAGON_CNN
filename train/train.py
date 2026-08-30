@@ -252,7 +252,6 @@ class RandomDihedralAugmentation(nn.Module):
 def train(**kwargs):
     """Train a DRAGON model and log the run to W&B."""
 
-    # Copy and log args
     args = {k: v for k, v in kwargs.items()}
 
     _seed_training(args["seed"])
@@ -278,10 +277,9 @@ def train(**kwargs):
             )
         args[parameter] = value
 
-    # Discover devices
     args["device"] = discover_devices()
 
-    # Resolve the shared run root and this experiment's isolated output directory.
+    # Keep each experiment inside the resolved run root.
     run_root = (
         Path(args["run_dir"])
         if args.get("run_dir")
@@ -304,7 +302,6 @@ def train(**kwargs):
     }
     model = DRAGON(**model_args).to(args["device"])
 
-    # Load the model from a saved state if provided
     if args["model_state"]:
         logging.info(f'Loading model from {args["model_state"]}...')
         load_model_state(model, args["model_state"], device=args["device"])
@@ -322,7 +319,6 @@ def train(**kwargs):
     )
     logging.info("Using %s optimizer with lr=%g.", args["optimizer"].upper(), args["lr0"])
 
-    # Create a DataLoader factory based on command-line args
     loader_factory = partial(
         get_data_loader,
         batch_size=args["batch_size"],
@@ -333,7 +329,6 @@ def train(**kwargs):
         [RandomDihedralAugmentation()] if args["augment"] else None
     )
 
-    # Generate the DataLoaders and log the train/devel/test split sizes
     splits = ("train", "devel", "test")
     datasets = {
         k: HDF5Dataset(
@@ -379,9 +374,7 @@ def train(**kwargs):
             f"{stored_image_shape} != {expected_image_shape}"
         )
 
-    # Training always holds one complete, already-normalized copy in
-    # parent-process RAM. All split datasets and forked DataLoader workers
-    # share these copy-on-write pages.
+    # Splits and forked workers share one normalized in-memory tensor store.
     preloaded_images = preload_h5_images(
         args["data_dir"],
         normalization_kwargs=normalization_kwargs,
@@ -393,9 +386,7 @@ def train(**kwargs):
     args["hdf5_preloaded_gib"] = preloaded_images.nbytes / 2**30
     args["normalization_stage"] = "hdf5_preload"
 
-    # Keep each split's RNG independent so devel/test iteration cannot consume
-    # the training shuffle stream. The generator also supplies reproducible
-    # worker base seeds to _seed_data_loader_worker.
+    # Give each split an independent, reproducible RNG stream.
     loaders = {}
     for split_index, (split_name, dataset) in enumerate(datasets.items()):
         generator = torch.Generator()
@@ -421,22 +412,17 @@ def train(**kwargs):
 
     criterion = ClassWeightedCrossEntropyLoss(weight=class_weights)
 
-    # Inputs are now validated and loaded. A same-named experiment is an
-    # explicit overwrite, so remove only the verified RUN_ROOT/EXPERIMENT
-    # target before W&B or training can create new output files.
+    # Reusing a validated experiment name replaces only that experiment.
     if experiment_dir.is_symlink() or experiment_dir.is_file():
         experiment_dir.unlink()
     elif experiment_dir.is_dir():
         shutil.rmtree(experiment_dir)
     experiment_dir.mkdir(parents=True, exist_ok=False)
 
-    # Log into W&B
     wandb.login()
 
-    # Configuration is immutable run input, not an epoch-zero history record.
     args = {**args, **model_stats(model)}
 
-    # Initializing W&B run
     with wandb.init(
         project=args["project"],
         name=args["experiment"],
@@ -445,7 +431,6 @@ def train(**kwargs):
     ) as run:
         model_path = experiment_dir / "model.pt"
 
-        # Set up trainer
         if args["train"]:
             logging.info("Creating trainer...")
             trainer = create_trainer(
@@ -483,13 +468,11 @@ def train(**kwargs):
                 max_grad_norm=args["max_grad_norm"],
             )
 
-        # Train and publish the devel macro-F1 best model selected by the trainer.
         trainer.run(loaders["train"], max_epochs=args["epochs"])
         best_model_path = trainer.best_model_path
         if best_model_path != model_path or not model_path.is_file():
             raise RuntimeError("Training completed without producing a best model.")
 
-        # Log model as an artifact
         logging.info(f"Uploading best model from {best_model_path}")
         run.log_artifact(best_model_path)
 

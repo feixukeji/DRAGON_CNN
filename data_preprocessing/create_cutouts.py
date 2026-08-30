@@ -27,9 +27,8 @@ PAIR_OBJECT_IDS_DATASET = "object_ids"
 RA_COLUMN = "ra"
 DEC_COLUMN = "dec"
 
-# Integer slicing can only co-register bands whose catalog centers differ by
-# whole pixels. The tolerance is far below the half-pixel convention this
-# module enforces and far above WCS round-off.
+# Integer slicing requires band centers to differ by whole pixels; this
+# tolerance separates WCS round-off from subpixel offsets.
 BAND_ALIGNMENT_TOLERANCE_PIX = 0.05
 
 CENTERING_CATALOG_WCS = "catalog_wcs"
@@ -105,8 +104,7 @@ def _catalog_pixel_center(header, ra, dec):
             wcs.det2im2,
         )
     )
-    # HSC coadd cutouts carry a plain TAN WCS, so the linear solution is exact
-    # and avoids an iterative solve per band per object.
+    # Plain TAN WCS needs no iterative solve.
     if has_distortion:
         x, y = wcs.all_world2pix(ra, dec, 0)
     else:
@@ -129,21 +127,10 @@ def _bands_share_a_pixel_grid(centers):
 
 
 def _center_crop_or_pad_tensor(tensor, size, center):
-    """Crop or zero-pad a 2D tensor to ``size`` about an explicit center.
+    """Crop or zero-pad around a ``(y, x)`` center without interpolation.
 
-    ``center`` is the ``(y, x)`` position, in this tensor's own zero-based
-    continuous pixel coordinates, that must land on the output's geometric
-    center ``(size - 1) / 2``; ``None`` selects the input's own geometric
-    center. The window origin is rounded to the nearest integer, so the
-    requested center lands within half a pixel of the output center and no
-    interpolation is performed.
-
-    Passing the source position measured from the catalog coordinate and the
-    image WCS is what keeps FITS-backed rows on the same subpixel convention
-    as generated pairs, which place their central source by the same rule.
-    An odd input dimension cannot put an even window on the input's own
-    center, so ``None`` is half a pixel off by construction; only rows with
-    no source to center are entitled to it.
+    ``None`` uses the input's geometric center. Integer window origins place an
+    explicit center within half a pixel of the output center.
     """
     height, width = tensor.shape
     if center is None:
@@ -294,18 +281,14 @@ def process_single_object(task):
             centers.append(_catalog_pixel_center(header, task.ra, task.dec))
             images.append(image)
         except Exception:
-            # Signal failure by returning None instead of zero-padding
             return task.df_index, None, CENTERING_FAILED
 
     if any(center is None for center in centers):
-        # A row without a catalog position or without a celestial WCS falls
-        # back for every band at once, never band by band. Background windows
-        # are the intended case: they carry no source to center.
+        # Fall back for every band together to preserve alignment.
         centers = [None] * len(centers)
         centering = CENTERING_GEOMETRIC
     elif not _bands_share_a_pixel_grid(centers):
-        # Integer slicing cannot co-register these bands, and the residual
-        # offset would read as a color gradient on the source itself.
+        # A residual offset would mimic a source color gradient.
         return task.df_index, None, CENTERING_BAND_MISALIGNED
     else:
         centering = CENTERING_CATALOG_WCS
@@ -600,8 +583,7 @@ def create_cutout_tensors(
     temporary_info_path = info_path.with_name(info_path.name + ".incomplete")
 
     try:
-        # Only this parent process writes the final HDF5 file. Workers return
-        # bounded ordered batches loaded from either FITS or pair HDF5 stores.
+        # Only the parent writes HDF5; workers return bounded ordered batches.
         with h5py.File(temporary_h5_path, 'w') as h5f:
             max_len = len(df)
 
@@ -657,8 +639,7 @@ def create_cutout_tensors(
             if current_h5_idx < max_len:
                 dset.resize(current_h5_idx, axis=0)
 
-        # Publish only runtime metadata plus the exact row-to-HDF5 map. Source
-        # FITS and pair-HDF5 references remain in the input raw_info.csv.
+        # Source references remain in raw_info.csv, not runtime metadata.
         aligned_info = _build_runtime_metadata(
             df,
             successful_indices,

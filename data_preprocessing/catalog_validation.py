@@ -9,8 +9,7 @@ import numpy as np
 import pandas as pd
 
 
-# One millionth of a degree. This covers ordinary CSV rounding noise without
-# treating genuinely distinct sky positions as the same source.
+# One millionth of a degree covers ordinary CSV rounding noise.
 DEFAULT_COORDINATE_TOLERANCE_ARCSEC = 0.0036
 
 
@@ -71,13 +70,9 @@ def discard_coordinate_equivalent_duplicates(
     tolerance_arcsec: float = DEFAULT_COORDINATE_TOLERANCE_ARCSEC,
     context: str = "DRAGON training catalogs",
 ) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
-    """Discard all repeated-ID rows that describe the same sky position.
+    """Discard repeated-ID coordinate components within ``tolerance_arcsec``.
 
-    Catalog names are used only to split the result back into classes. For a
-    repeated original ``object_id``, every coordinate-connected component with
-    at least two rows is discarded in full. Rows with that ID at positions
-    farther apart than ``tolerance_arcsec`` remain available for later class
-    prefixing.
+    Same-ID rows outside the tolerance are retained.
     """
     if not math.isfinite(tolerance_arcsec) or tolerance_arcsec < 0:
         raise ValueError("Coordinate tolerance must be a finite non-negative value")

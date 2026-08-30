@@ -100,12 +100,9 @@ def _channel_limits(values, channels, name):
 
 
 def asinh_normalize(X, *, vmin, vmax, softening):
-    """Apply the fixed, training-statistics asinh normalization.
+    """Apply fixed asinh normalization and clamp the result to ``[0, 1]``.
 
-    ``vmin``, ``vmax``, and ``softening`` must come from the dataset-level
-    ``normalization_stats.json``. Inputs may have shape ``(H, W)``,
-    ``(C, H, W)``, or ``(B, C, H, W)`` and outputs are finite floating-point
-    values in ``[0, 1]``.
+    Accepts ``(H, W)``, ``(C, H, W)``, or ``(B, C, H, W)`` tensors.
     """
     if not torch.is_tensor(X):
         raise TypeError("X must be a torch.Tensor.")
