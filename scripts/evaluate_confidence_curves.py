@@ -421,15 +421,12 @@ def predict_all_probabilities(
     normalization_kwargs: dict[str, object],
     batch_size: int,
     n_workers: int,
-    parallel: bool,
 ) -> np.ndarray:
     """Run one inference pass and return the complete N x C softmax array."""
     device = discover_devices()
     model = DRAGON(channels=channels, num_classes=num_classes)
     logging.info("Loading model from %s", model_path)
     load_model_state(model, model_path, device=device)
-    if parallel and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
     model = model.to(device)
     model.eval()
 
@@ -797,7 +794,6 @@ def _plot_negative_class_fpr(
 )
 @click.option("--batch-size", type=click.IntRange(min=1), default=256, show_default=True)
 @click.option("--n-workers", type=click.IntRange(min=0), default=4, show_default=True)
-@click.option("--parallel/--no-parallel", default=True, show_default=True)
 @click.option(
     "--curve-points",
     type=click.IntRange(min=2),
@@ -815,7 +811,6 @@ def main(
     target_fpr: float,
     batch_size: int,
     n_workers: int,
-    parallel: bool,
     curve_points: int,
 ) -> None:
     """Create all-class confidence curves and worst-class FPR thresholds."""
@@ -895,7 +890,6 @@ def main(
             normalization_kwargs=normalization_kwargs,
             batch_size=batch_size,
             n_workers=n_workers,
-            parallel=parallel,
         )
         calibrations = calibrate_all_classes(
             np.asarray(dataset.labels, dtype=np.int64),

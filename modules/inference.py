@@ -34,7 +34,6 @@ def predict_probabilities(
     model_path,
     dataset,
     channels,
-    parallel=False,
     batch_size=256,
     n_workers=1,
     num_classes=6,
@@ -59,8 +58,6 @@ def predict_probabilities(
     model = DRAGON(**model_args)
     logging.info("Loading model from %s", model_path)
     load_model_state(model, model_path, device=device)
-    if parallel and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
     model = model.to(device)
 
     loader = get_data_loader(
@@ -121,7 +118,6 @@ def predict(
     model_path,
     dataset,
     channels,
-    parallel=False,
     batch_size=256,
     n_workers=1,
     num_classes=6,
@@ -132,7 +128,6 @@ def predict(
         model_path,
         dataset,
         channels,
-        parallel=parallel,
         batch_size=batch_size,
         n_workers=n_workers,
         num_classes=num_classes,
@@ -182,7 +177,6 @@ def predict(
 )
 @click.option("--batch-size", type=int, default=256)
 @click.option("--n-workers", type=int, default=4)
-@click.option("--parallel/--no-parallel", default=True)
 @click.option(
     "--n-classes",
     type=int,
@@ -209,7 +203,6 @@ def main(
     labels_path,
     batch_size,
     n_workers,
-    parallel,
     n_classes,
     labels,
     all_probabilities,
@@ -268,7 +261,6 @@ def main(
         model_path,
         dataset,
         channels,
-        parallel=parallel,
         batch_size=batch_size,
         n_workers=n_workers,
         num_classes=n_classes,

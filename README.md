@@ -8,9 +8,11 @@ EigenGradCAM visualizations.
 
 ## Features
 
-- An eight-block residual convolutional network with anti-aliased
-  downsampling and a global-average-pooled head; input side lengths only
-  have to be multiples of 16, from 32 upward.
+- A four-stage residual convolutional network whose resolution schedule and
+  head geometry are both derived from the angular scales the labels are made
+  of, with anti-aliased downsampling and a concentric-ring pooled head read
+  from all four stages through one hidden layer; input side lengths only have
+  to be multiples of 8, from 48 upward.
 - `--channels` and `--n-classes` are required wherever a model is built, so a
   default can never silently disagree with the cutouts or with `labels.csv`.
 - Configurable input channels and output classes.
@@ -65,7 +67,7 @@ directory.
 
 | Contract | Requirement |
 | --- | --- |
-| Image shape | Side lengths must be multiples of 16 and at least 32, because the network halves the map four times and the last stage still has to pad its map by one; `96 × 96` is the default everywhere. The channel count is configurable. |
+| Image shape | Side lengths must be multiples of 8 and at least 48, because the network halves the map three times and the head's outermost ring, anchored at 4 arcsec, must still contain positions at `layer2`; `96 × 96` is the default everywhere. The channel count is configurable. |
 | Channel order | Repeated `--bands` and `--band` options define tensor channel order. That positional order must match the normalization statistics and checkpoint; later stages receive only the channel count and cannot validate band semantics. |
 | Class mapping | `labels.csv` defines the zero-based class order shared by `--n-classes`, the checkpoint classifier head, `probability__*` columns, and the threshold manifest. |
 | Row alignment | Every runtime metadata row contains one unique, in-range integer `h5_index` pointing into `tensors/tensors.h5`. |
@@ -324,45 +326,271 @@ runtime metadata after `h5_index` is assigned.
 ## Model
 
 DRAGON accepts `(batch, channels, H, W)` tensors. `H` and `W` must be
-multiples of 16 and at least 32, because the feature extractor halves the map
-four times and the last stage still has to pad its map by one. The
-global-average-pooled head carries no size-dependent weights, so one
-architecture serves every such size; `96 × 96` is the default and the size the
-block table below describes.
+multiples of 8 and at least 48, because the feature extractor halves the map
+three times and the head's outermost ring boundary sits at 4 arcsec, which
+`layer2` can only place inside a map of at least `24 × 24`. The ring-pooled
+head carries no size-dependent weights, so one architecture serves every such
+size; `96 × 96` is the default and the size the block table below describes.
 
-The extractor is eight blocks, `layer1` through `layer8`. Odd-numbered stages
-after the first are `ResidualBlock`s (two `3×3` convolutions on an identity
-shortcut); the rest are `Conv2d → BatchNorm2d → LeakyReLU`, each preceded from
-`layer2` onward by a `MaxBlurPool2d` that halves the map. Widths and map sizes:
+The resolution schedule is derived from the scales the labels are made of, not
+from a generic classifier backbone. At `0.168 arcsec/pixel` those are the PSF
+core (`3.6–4.8 px`), the pair separation (`2.2–24.3 px`, log-uniform, median
+`8.9 px`, 10th percentile `4.4 px`) and tidal features (`60+ px`). Measuring a structure of size `s`
+needs a stride of at most `s/2` so it is sampled at all, and a receptive field
+of roughly `2s` so a unit sees it whole against its background. That fixes
+four stages:
 
 ~~~text
-layer1  48 @ 96×96               layer5  128 @ 24×24   (residual)
-layer2  64 @ 48×48               layer6  256 @ 12×12
-layer3  64 @ 48×48   (residual)  layer7  256 @ 12×12   (residual)
-layer4 128 @ 24×24               layer8  512 @  6×6
+layer1   24 @ 96×96   stride 1   RF  11 px   PSF core, seeing-limited pairs
+layer2   64 @ 48×48   stride 2   RF  26 px   the bulk of the separation range
+layer3  128 @ 24×24   stride 4   RF  56 px   widest pairs plus environment
+layer4   96 @ 12×12   stride 8   RF 116 px   full field: tidal features
 ~~~
 
-`MaxBlurPool2d` is an anti-aliased downsample: a stride-1 `2×2` max, then a
-reflection-padded binomial blur subsampled by 2. Average pooling would erase
-the saddle between two close PSFs, which is the feature that separates a pair
-from a single source; plain strided max pooling keeps the peak but aliases it.
-The blur samples an even-sized map symmetrically, so the eight dihedral
-training augmentations stay equivalent views of the same object.
+`layer1` is four convolutions at stride 1 (`5×5` then three `3×3`), which is
+what it takes to reach an 11 px receptive field before anything is
+downsampled. Its last block stops at the BatchNorm: stage outputs do not end
+in an activation, because every consumer rectifies what it reads, and a
+LeakyReLU here followed by `Downsample`'s would multiply the negative tail by
+`0.01` twice over. Each later stage is `Downsample → Conv2d → BatchNorm2d →
+LeakyReLU → ResidualBlock`, where the projection is not always a widening —
+`layer4` narrows, since a same-width `3×3` there bought nothing but
+parameters. There is no fifth stage, though not because
+`layer4`'s 116 px theoretical receptive field covers the cutout: effective
+receptive fields are a fraction of the theoretical one. The reason is
+parameter allocation — a residual block costs `2·C²·9` parameters wherever it
+sits, so each further stage is the most expensive one, and only the merger
+class needs a scale coarser than `layer4`.
+
+`Downsample` is a `LeakyReLU` followed by `BlurPool2d`: a replicate-padded
+`[1,3,3,1]` binomial low-pass subsampled by 2. Low-pass before subsampling is
+Nyquist, and that is all this layer does — it does not take a max first. The
+usual argument for the max is that average pooling divides a point source's
+peak by four while dividing its noise only by two, but that holds for a source
+confined to one pixel and the HSC PSF is roughly twice oversampled. On a 4 px
+FWHM Gaussian in noise, one `2×` downsample changes the peak SNR by `1.45×`
+(average), `1.39×` (max), `2.23×` (blur) and `1.98×` (max-then-blur); with a
+companion at five percent of the primary, by `1.42×`, `1.32×`, `2.08×` and
+`1.83×`. The four-tap kernel is what an even-sized map needs to be sampled
+symmetrically, which keeps the eight dihedral training views exactly
+equivalent. The border is replicated for the same reason the convolutions
+replicate theirs: reflection holds unit gain and dihedral equivalence just as
+exactly, but it mirrors an edge source into a second copy of itself, which is
+the structure this network looks for.
+
+Convolutions replicate the border rather than zero-filling it.
+`asinh_normalize` clamps to `[0, 1]` and expands the faint end, so the sky
+sits at a clearly positive value and a zero-filled border is darker than any
+realistic pixel; the resulting kernel-mass deficit (`2/3` along an edge, `4/9`
+in a corner) is a per-position gain that BatchNorm cannot undo. Reflection
+would keep unit gain too, but it mirrors a source near the edge into a second
+copy of itself, which is the structure this network looks for.
 
 Residual blocks apply no activation after the sum, and `bn2.weight` is zeroed
-at initialization, so each block starts as exactly the identity.
+at initialization, so each block starts as exactly the identity. One block per
+stage: without a post-sum activation, stacking two would put the first block's
+`bn2` straight into the second's `conv1` with no nonlinearity between them.
+Anything consuming a block's output rectifies it first.
 
-The `512 × 6 × 6` feature map is global-average-pooled to `512`, passed through
-dropout with probability `0.5`, and classified by a single `Linear` layer. A
-three-channel, six-class instance has 3,132,406 parameters and costs about
-713 MMAC per `96 × 96` image.
+`RingPool` replaces global average pooling in the head. The classes are
+defined by a radius — the central source sits at the exact centre and a
+companion is a companion only within `theta_max` of it. Ring boundaries are
+fixed in angle at `0.5`, `1`, `2` and `4 arcsec`, so the bins mean the same
+thing at every stage and every cutout size, and the separation range is split
+into four bins rather than swallowed whole by one. The `0.5 arcsec` edge
+separates the central source's own core from the closest companion it could
+have and survives only at `layer2`; `stride 4` and `8` drop it, since a
+boundary below 1.5 feature-map pixels is not sampled. Rings are exactly
+invariant under all eight dihedral transforms because each is a
+dihedral-symmetric set of positions. Only the inner boundaries are fixed in
+angle; the last ring runs from `4 arcsec` to the map corner, so its extent does
+depend on the cutout size.
+
+Each ring but the last contributes both a mean and a max, on different inputs.
+The max reads a rectified map, since `amax` over a signed one erodes whatever
+the network encoded negatively; the mean reads the raw signed map, because it
+is linear and rectifying first would compress a negative-coded feature by a
+factor of a hundred for nothing. The outermost ring usually keeps only its
+mean: no companion of interest sits beyond `theta_max`, so "is there a peak out
+there" is not a question worth another `C` dimensions.
+
+A redundancy argument used to stand alongside that one — mean and max
+correlating at `0.96` on the outer ring against `0.26` innermost — and it is
+withdrawn. On the trained model's own feature maps the ordering is reversed:
+outermost `r = 0.00, 0.03, 0.19, 0.36` at taps 1–4 against innermost
+`r = 0.71, 0.91, 0.93, 0.94`, which is what a four-position ring should give.
+The `0.96` was measured on raw cutouts, where an outer ring is mostly sky.
+
+`layer3` and `layer4` are the exceptions and keep that max. Both reasons above
+are reasons about companions, and `merger` is not a companion class: its
+evidence is a tidal feature at `20–60 px`, most of which lies beyond the
+`4 arcsec` edge and so sits in exactly this ring. It is localised and
+azimuthally asymmetric, so the ring's mean divides it by the ratio of the
+ring's positions to the ones it occupies, while `max - mean` is its detector.
+The rule is not "outermost" but whether one map position already integrates an
+area the size of the structure the ring reports — `56 px` of receptive field at
+`layer3` and `116 px` at `layer4` against a `20–60 px` feature, but `26 px` at
+`layer2` and `11 px` at `layer1`, whose outermost rings also hold 1,856 and
+7,412 positions, so the max there is an extreme-value statistic over field
+sources common to every class. That is two clauses and only the first is
+scale-free. Applied to the inner rings the first passes everywhere — what a
+`0.5–4 arcsec` ring reports is a companion, a `3.6–4.8 px` PSF, which `11 px`
+of receptive field already integrates — while the second does not, since
+`tap1`'s `2–4 arcsec` ring holds 1,356 positions and `tap2`'s 336. Those maxes
+are kept because there the extreme *is* the thing being looked for.
+
+The statistic that would attack the contamination directly is an azimuthal
+dipole modulus, `|Σ x e^{iφ}| / Σ|x|`: exactly zero on any azimuthally
+symmetric profile (measured, `1e-17`), exactly dihedral-invariant, bounded in
+`[0, 1]`, and not affinely constructible. On raw cutouts it is worth a great
+deal — Fisher `d` from `1.3` to `2.7` for a 5 percent tidal arc under a
+brightness nuisance. It is not in the model because the network already has it:
+a rectified sum over 8 oriented channels reconstructs a modulus to 6 percent
+ripple and `layer3` has 128. Measured on the trained model, adding it moves
+held-out balanced accuracy from `0.890` to `0.886`. `merger` is also not short
+of evidence — a linear probe on the pooled statistics alone separates it from
+`single_galaxy` at AUC `0.995` and from `agn_galaxy` at `0.998`.
+
+`max - mean` is the asymmetric part of a ring only on a thin ring, and these
+are an octave wide. A centred source with any radial gradient puts its max at
+the ring's inner edge and its mean well below it, with no companion involved:
+on a purely azimuthally symmetric `4 px` Moffat, `(max - mean)/mean` on the
+real tap geometries runs `0.00, 1.11, 1.47, 3.56, 5.51` at stride 2 and
+`0.00, 1.73, 2.65` at stride 8. Only the innermost ring, whose four positions
+share one radius, is clean. Separating the asymmetry from the radial gradient
+means dividing by the mean, which is a ratio.
+
+The head reads from all four stages. Pooling and nonlinearity do not preserve a
+quantitative "how far apart", and by the `stride ≤ s/2` rule `layer3` can only
+measure structure of 8 px and up, while the tightest pairs are `2.2–4.5 px`.
+`layer2` covers the separation range, `layer3` covers it with environment, and
+`layer4` covers the field the merger class needs. `layer1` is tapped because
+the same rule reaches it: the `BlurPool` transfer function passes `0.83` of the
+contrast at the median `8.9 px` separation, `0.43` at `4.4 px`, `0.27` at
+`3.6 px` and nothing at the realised minimum `2.2 px`, so `layer1` is the only
+stage that sees the tightest quarter of the pairs at full contrast and the only
+one where central compactness — the `merger` / `agn_galaxy` boundary — is
+resolved. It costs 216 features and about 1 MMAC.
+
+Each tap rectifies the stage's signed residual sum before feeding the max
+branch. The concatenated statistics pass through `BatchNorm1d` — the mean and
+max branches have different scales, and one linear layer under one dropout rate
+would otherwise have to treat them alike — then dropout with probability `0.4`,
+a `head_width` hidden layer (`Linear → BatchNorm1d → LeakyReLU`), and the
+output `Linear`.
+
+The hidden layer is there because colour, not geometry, separates several of
+the classes: `dual_agn` and `agn_star` both put an unresolved point source at
+the same radius, and `single_star` and `single_agn` both put one at the centre.
+Colour is a ratio of band fluxes, an affine head cannot form a ratio, and the
+nuisance it would have to divide out is real — the injected amplitude `alpha`
+spans a factor of six and scales the offset source's contribution to a ring
+statistic without scaling the central source's. For "is there a companion" that
+costs only calibration, since a positive rescaling leaves the sign of a linear
+discriminant alone; for "which companion" it costs sight, because the
+label-irrelevant central term does not scale with `alpha` and one hyperplane
+has to separate the whole family. The radial-gradient ratio above needs the
+same thing.
+
+`head_width` defaults to 96: the rank-8 discriminant an affine head already
+realised, a direction for each of the 32 `(ring, statistic)` slots the four
+taps expose, and one per max ring for the ratio. The dropout sits on the 2,392
+pooled statistics rather than on the hidden layer — at `p = 0.4` a 96-unit
+bottleneck keeps 58 units on average, close to the count it was just sized for,
+and the wide side holds 98 percent of the head's parameters. The cost is a
+`BatchNorm` downstream of a dropout, whose variance inflation lands as a
+near-uniform rescaling that threshold calibration absorbs.
+
+`widths` is the only capacity knob on the backbone, and multiply-accumulates
+and parameters must not be conflated. Moving capacity towards fine scales costs
+arithmetic quadratically, because the map is sixteen times larger at stride 1
+than at stride 4; moving it towards coarse ones costs parameters, because a
+residual block costs `2·C²·9` wherever it sits and the widest stage is always
+the last. Wall-clock follows the arithmetic. The default `(24, 64, 128, 96)`
+widens `layer2` and narrows `layer4` relative to a monotonic table:
+
+~~~text
+             parameters          MMAC
+layer1    17,544   ( 1.8%)   159.9  (26.0%)
+layer2    87,936   ( 8.9%)   201.7  (32.7%)
+layer3   369,408   ( 37.4%)  212.3  (34.5%)
+layer4   277,056   ( 28.1%)   39.8  ( 6.5%)
+head     235,480   ( 23.8%)    0.2  ( 0.0%)
+ring taps      --              2.2  ( 0.4%)
+~~~
+
+A three-channel, eight-class instance has 987,424 parameters and costs about
+616 MMAC per `96 × 96` image.
+
+That table sits awkwardly with the `stride ≤ s/2` rule: `layer3` can only
+measure the upper half of the separation distribution and holds 37 percent of
+the parameters, while `layer2` — the only stage measuring `4–8 px` and the only
+one keeping the `0.5 arcsec` boundary — holds 9. The alternative
+`(24, 96, 96, 64)` gives 803k parameters and 754 MMAC, with `layer2` at 23
+percent and `layer4` at 16. It is not free, and the rule says which stage can
+*measure* a separation rather than how many channels companion typing needs, so
+the table is left for measurement. `layer4` has the weakest case: its `116 px`
+receptive field exceeds the field, and `tap4` reports three rings of 4, 28 and
+112 positions — near-global descriptors. Narrowing it, `(24, 64, 128, 48)`,
+saves 21 percent of the parameters and 4 percent of the arithmetic but
+concentrates rather than rebalances, putting `layer3` at 47 percent.
+
+The simulation leaves a shortcut and nothing here blocks it. `Y = C + alpha·M·S`
+with no background subtraction raises the noise variance inside the injected
+mask's support by `1 + alpha²`. It is not confined to fine strides: a stage
+rectifies before it pools, so a high-pass followed by a `LeakyReLU` turns noise
+power into a non-negative map whose local mean `BlurPool` carries through
+untouched — measured against a 4.4 percent sigma step, Cohen's `d` is
+`0.093, 0.095, 0.097, 0.097` at strides 1, 2, 4 and 8. It is also weak: `alpha`
+is uniform on `[0.05, 0.30)`, and a sample standard deviation over `N` pixels
+has relative precision `1/√(2N)`, bounding even an oracle estimator at
+`d ≤ 0.044·√(2N)` — about `0.9` at `N = 200` and the largest `alpha`, about
+`0.3` at the median. That bound is what matters rather than the single-feature
+`0.09`, because the head sees 2,392 statistics over 312 channels and weak cues
+read repeatedly add in quadrature; the 312 channels are 312 looks at one noise
+field, so no width buys information the pixels do not hold. The per-image
+discriminant is bounded near `d ~ 0.3`; the per-population cue is not bounded,
+and the population is 204,039 of the 480,278 training images — 42 percent:
+70,000 `dual_agn`, 70,000 `agn_star`, 64,039 `agn_galaxy`. Suppressing it is
+the data pipeline's job.
+
+`ResidualBlock` is one block per stage. Stacking two would put the first
+block's `bn2` straight into the second's `conv1` with no nonlinearity between
+them, but nothing here wants to stack: at thirteen learned convolutions the
+shortcut is not carrying trainability, it is carrying the identity
+initialization, which starts the model as a seven-convolution plain net and
+lets it grow under a cosine schedule with no warmup.
+
+Two limitations are left in place. The width table is left for measurement,
+above. And the model is given no seeing and no invariance to overall
+brightness.
+
+The network sees pixels only. `theta_max` depends on redshift and `theta`'s
+lower bound is the seeing of that exposure, so the class boundary is a function
+of `(z, seeing)` that varies image to image; the scale table above is the
+population's marginal distribution, not any single cutout's. The two are not
+equally forced: redshift is unavailable for most deployment targets, while
+seeing is available for every HSC cutout and is the decisive nuisance for the
+tightest pairs. Feeding it is a data question — the cutout store carries no
+seeing column — rather than an architectural one now that the head is not
+affine.
+
+Two things the radius schedule does not reach at all. `single_star` against
+`single_agn`, and `dual_agn` against `agn_star`, put the same unresolved point
+source in the same place; only the spectral energy distribution differs, so the
+ring geometry, the edge table and the dihedral augmentation are structurally
+silent on them. And nothing here is invariant to overall brightness:
+`asinh_normalize` uses fixed dataset-level limits, there is no instance
+normalization, and the eight classes have quite different magnitude selection
+functions — total flux is a usable shortcut, suppressed entirely on the data
+side and not at all here.
 
 ## Training behavior
 
 The training entry point selects CUDA when available and otherwise uses the
-CPU. Training uses one device; it does not use DataParallel or distributed
-training. CUDA runs use bfloat16 automatic mixed precision through PyTorch
-Ignite.
+CPU. Every stage runs on one device: the project uses neither DataParallel nor
+distributed execution, for training or for inference. CUDA runs use bfloat16
+automatic mixed precision through PyTorch Ignite.
 
 Before the first epoch, the complete HDF5 `images` dataset is read into one
 C-contiguous `float32` array, normalized in bounded blocks on the selected
@@ -460,9 +688,13 @@ python -m scripts.convert_model_channels \
   --target-classes 3
 ~~~
 
-`--target-channels` adapts the first convolution. `--target-classes` resets the
-classifier when its output size changes. The output parent directory must
-already exist.
+`--target-channels` adapts the first convolution. `--target-classes` defaults
+to the checkpoint's own class count; the head is rebuilt whenever any of its
+tensors no longer matches the current architecture — a changed class count, a
+changed ring-statistic width, or a changed head layout — and kept untouched
+when they all still match. Replacements come from the model's own
+initialisation under `--seed` (default 42), so the conversion is reproducible.
+The output parent directory must already exist.
 
 Run gradual transfer learning with the adapted checkpoint:
 
@@ -482,9 +714,9 @@ python -m train.train \
   --lr0 2e-5
 ~~~
 
-Transfer learning initially trains only the `classifier` head while all eight
-`layerN` blocks are frozen. After the warmup, complete blocks are unfrozen from
-`layer8` toward `layer1`. Frozen blocks remain in evaluation mode so their
+Transfer learning initially trains only the head while all four `layerN`
+blocks are frozen. After the warmup, complete blocks are unfrozen from `layer4`
+toward `layer1`. Frozen blocks remain in evaluation mode so their
 BatchNorm parameters and running statistics do not change.
 
 ## Training reports
@@ -651,8 +883,7 @@ retaining the four top-2 columns. Probability values are written with enough
 decimal precision to preserve the model's float32 scores when pandas reads the
 CSV as float64; this keeps `>=` comparisons against calibrated thresholds
 stable. Inference streams HDF5 batches instead of preloading the entire tensor
-store. When multiple CUDA devices are available, `--parallel` allows inference
-to use `DataParallel`.
+store, and runs on the single device selected by `discover_devices`.
 
 ## EigenGradCAM heatmaps
 
@@ -672,7 +903,7 @@ python -m modules.heatmap \
   --output-workers 4
 ~~~
 
-The implementation targets `layer4`, uses the model's predicted class, and
+The implementation targets `layer3`, uses the model's predicted class, and
 computes batched principal-component projections on the model device. PNG
 rendering is parallelized with `--output-workers`.
 
@@ -696,7 +927,7 @@ Every command provides full option documentation through `--help`:
 | `python -m data_preprocessing.compute_normalization_stats` | Estimate and save training-split normalization values. |
 | `python -m data_preprocessing.prepare_inference` | Build one inference catalog and tensor store. |
 | `python -m train.train` | Train from scratch or perform gradual transfer learning. |
-| `python -m scripts.convert_model_channels` | Adapt checkpoint input channels and classifier size. |
+| `python -m scripts.convert_model_channels` | Adapt checkpoint input channels and rebuild a head that no longer fits. |
 | `python -m scripts.report_training_results` | Print metrics from one experiment or run root. |
 | `python -m scripts.evaluate_confidence_curves` | Export all-class confidence curves and calibrate worst-negative-class FPR thresholds. |
 | `python -m modules.inference` | Write top-2 predictions and optionally every class probability for an inference catalog. |

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import torch
 
 from cnn import (
+    DRAGON,
     DRAGON_CLASSIFIER_BIAS_KEY,
-    DRAGON_CLASSIFIER_WEIGHT_KEY,
     DRAGON_FIRST_CONV_WEIGHT_KEY,
+    DRAGON_HEAD_PREFIXES,
 )
 from utils.model_utils import load_plain_state_dict
+
+DEFAULT_SEED = 42
 
 
 def _find_conv_key(state_dict: dict[str, torch.Tensor]) -> str:
@@ -43,47 +45,57 @@ def _adapt_conv_weight(weight: torch.Tensor, target_channels: int) -> torch.Tens
     return weight[:, :target_channels, :, :]
 
 
-def _find_classifier_pairs(
-    state_dict: dict[str, torch.Tensor],
-) -> list[tuple[str, str]]:
-    weight_key = DRAGON_CLASSIFIER_WEIGHT_KEY
-    bias_key = DRAGON_CLASSIFIER_BIAS_KEY
-    if weight_key not in state_dict or bias_key not in state_dict:
-        raise KeyError(
-            f"DRAGON checkpoint must contain {weight_key!r} and {bias_key!r}"
-        )
-    return [(weight_key, bias_key)]
+def _checkpoint_classes(state_dict: dict[str, torch.Tensor]) -> int:
+    """Read the checkpoint's own class count from the classifier bias."""
+    if DRAGON_CLASSIFIER_BIAS_KEY not in state_dict:
+        raise KeyError(f"DRAGON checkpoint must contain {DRAGON_CLASSIFIER_BIAS_KEY!r}")
+    return int(state_dict[DRAGON_CLASSIFIER_BIAS_KEY].shape[0])
 
 
-def _adapt_classifier(
+def _adapt_head(
     state_dict: dict[str, torch.Tensor],
+    target_channels: int,
     target_classes: int | None,
+    seed: int,
 ) -> list[str]:
-    if target_classes is None:
-        return []
-    if target_classes <= 0:
+    """Rebuild the head when the checkpoint's no longer fits the architecture.
+
+    The backbone transfers whenever its shapes still match, but the head does
+    not survive a change in class count, in the statistics the taps emit, or in
+    how the head is built -- and only the first of those shows up in the output
+    layer. Patching that layer in place, which is what this script used to do,
+    silently keeps a stale feature width and fails much later at load. So the
+    unit of replacement is every parameter under ``DRAGON_HEAD_PREFIXES``, and
+    it is replaced only when at least one of them actually mismatches, so an
+    unchanged head keeps its trained weights.
+
+    The replacements come from ``DRAGON._initialize_weights`` rather than from a
+    rule restated here, and ``seed`` is set first, so the converted head is
+    reproducible from the same source checkpoint.
+    """
+    if target_classes is not None and target_classes <= 0:
         raise ValueError("target_classes must be positive")
+    classes = target_classes or _checkpoint_classes(state_dict)
 
-    updated: list[str] = []
-    for weight_key, bias_key in _find_classifier_pairs(state_dict):
-        weight = state_dict[weight_key]
-        bias = state_dict[bias_key]
+    torch.manual_seed(seed)
+    reference = DRAGON(channels=target_channels, num_classes=classes).state_dict()
+    head_keys = [key for key in reference if key.startswith(DRAGON_HEAD_PREFIXES)]
 
-        if weight.ndim != 2 or bias.ndim != 1:
-            continue
-        if weight.shape[0] == target_classes and bias.shape[0] == target_classes:
-            continue
+    mismatched = [
+        key
+        for key in head_keys
+        if key not in state_dict
+        or tuple(state_dict[key].shape) != tuple(reference[key].shape)
+    ]
+    if not mismatched:
+        return []
 
-        new_weight = torch.empty(
-            (target_classes, weight.shape[1]), dtype=weight.dtype
-        )
-        torch.nn.init.kaiming_uniform_(new_weight, a=math.sqrt(5))
-        new_bias = torch.zeros((target_classes,), dtype=bias.dtype)
-
-        state_dict[weight_key] = new_weight
-        state_dict[bias_key] = new_bias
-        updated.append(weight_key)
-    return updated
+    for key in [key for key in state_dict if key.startswith(DRAGON_HEAD_PREFIXES)]:
+        del state_dict[key]
+    for key in head_keys:
+        value = reference[key]
+        state_dict[key] = value.clone()
+    return head_keys
 
 
 def main() -> None:
@@ -102,7 +114,16 @@ def main() -> None:
         "--target-classes",
         type=int,
         default=None,
-        help="Optional target output class count to reset classifier",
+        help=(
+            "Target output class count; defaults to the checkpoint's own. The "
+            "head is rebuilt whenever it no longer fits, class count or not."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Seed for any head parameters this conversion has to initialise",
     )
     args = parser.parse_args()
 
@@ -118,7 +139,9 @@ def main() -> None:
     new_weight = _adapt_conv_weight(weight, args.target_channels)
 
     state_dict[conv_key] = new_weight
-    updated_heads = _adapt_classifier(state_dict, args.target_classes)
+    updated_heads = _adapt_head(
+        state_dict, args.target_channels, args.target_classes, args.seed
+    )
     torch.save(state_dict, args.out_model)
 
     print(
@@ -126,7 +149,9 @@ def main() -> None:
         f"{tuple(weight.shape)} -> {tuple(new_weight.shape)})"
     )
     if updated_heads:
-        print(f"Reset classifier weights: {', '.join(updated_heads)}")
+        print(f"Reinitialised head ({len(updated_heads)} tensors, seed {args.seed})")
+    else:
+        print("Head kept: every head tensor already matches the architecture")
 
 
 if __name__ == "__main__":

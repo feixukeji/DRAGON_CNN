@@ -4,8 +4,6 @@ from pathlib import Path
 
 import click
 import cv2
-import torch
-import torch.nn as nn
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from tqdm import tqdm
 
@@ -126,7 +124,6 @@ def heatmap(
         output_dir,
         dataset,
         channels,
-        parallel=False,
         batch_size=256,
         n_workers=1,
         output_workers=4,
@@ -160,8 +157,6 @@ def heatmap(
     # Load the model
     logging.info("Loading model...")
     load_model_state(model, model_path, device=device)
-    if parallel and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
     model = model.to(device)
 
     # Set to evaluation mode
@@ -175,8 +170,9 @@ def heatmap(
         shuffle=False,
     )
 
-    # Acquiring GradCAM layer
-    target_layer = model.module.layer4 if isinstance(model, nn.DataParallel) else model.layer4
+    # layer3 runs at stride 4 with a 56 px receptive field, which is the scale
+    # the separation lives on; layer4 has already pooled it away.
+    target_layer = model.layer3
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -273,12 +269,6 @@ def heatmap(
     help="Number of threads used to render and write PNG overlays.",
 )
 @click.option(
-    "--parallel/--no-parallel",
-    default=True,
-    help="""The parallel argument controls whether or not
-              to use multiple GPUs when they are available""",
-)
-@click.option(
     "--n-classes",
     type=int,
     required=True,
@@ -290,7 +280,6 @@ def main(
     data_dir,
     cutout_size,
     channels,
-    parallel,
     normalization_stats,
     batch_size,
     n_workers,
@@ -334,7 +323,6 @@ def main(
         output_dir,
         dataset,
         channels,
-        parallel=parallel,
         batch_size=batch_size,
         n_workers=n_workers,
         output_workers=output_workers,

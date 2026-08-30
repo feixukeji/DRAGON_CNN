@@ -1,5 +1,6 @@
 import multiprocessing as mp
-from collections import deque
+import warnings
+from collections import Counter, deque
 from concurrent.futures import ProcessPoolExecutor
 from itertools import islice
 from pathlib import Path
@@ -12,6 +13,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from astropy.io import fits
+from astropy.wcs import FITSFixedWarning, WCS
 from tqdm import tqdm
 
 MAX_BATCH_ROWS = 64
@@ -22,6 +24,19 @@ TENSOR_INDEX_COLUMN = "tensor_index"
 TENSOR_OBJECT_ID_COLUMN = "tensor_object_id"
 PAIR_IMAGES_DATASET = "images"
 PAIR_OBJECT_IDS_DATASET = "object_ids"
+RA_COLUMN = "ra"
+DEC_COLUMN = "dec"
+
+# Integer slicing can only co-register bands whose catalog centers differ by
+# whole pixels. The tolerance is far below the half-pixel convention this
+# module enforces and far above WCS round-off.
+BAND_ALIGNMENT_TOLERANCE_PIX = 0.05
+
+CENTERING_CATALOG_WCS = "catalog_wcs"
+CENTERING_GEOMETRIC = "geometric"
+CENTERING_BAND_MISALIGNED = "band_misaligned"
+CENTERING_FAILED = "failed"
+CENTERING_PAIR_TENSOR = "pair_tensor"
 
 
 class ObjectTask(NamedTuple):
@@ -34,58 +49,127 @@ class ObjectTask(NamedTuple):
     tensor_object_id: str | None
     cutout_size: int
     bands: tuple[str, ...]
+    ra: float | None
+    dec: float | None
 
 
 _PAIR_H5_CACHE = {}
 
 
-def _load_fits_tensor(filename):
-    """Load the first usable 2D FITS image as a float32 tensor."""
-    image = None
-    try:
-        image = fits.getdata(filename, memmap=False)
-    except (IndexError, KeyError, TypeError, ValueError):
-        pass
-
-    if image is None or not hasattr(image, "shape") or image.ndim != 2:
-        with fits.open(filename, memmap=False) as hdus:
-            image = next(
-                (
-                    hdu.data
-                    for hdu in hdus
-                    if hdu.data is not None
-                    and hasattr(hdu.data, "shape")
-                    and hdu.data.ndim == 2
-                ),
-                None,
-            )
-        if image is None:
-            raise ValueError(f"No valid 2D image array in {filename}")
-
-    image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
-    return torch.from_numpy(image.astype(np.float32))
+def _load_fits_image(filename):
+    """Load the first usable 2D FITS image as a float32 tensor plus header."""
+    with fits.open(filename, memmap=False) as hdus:
+        for hdu in hdus:
+            image = hdu.data
+            if (
+                image is not None
+                and hasattr(image, "shape")
+                and image.ndim == 2
+            ):
+                image = np.nan_to_num(
+                    image,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                return (
+                    torch.from_numpy(image.astype(np.float32)),
+                    hdu.header.copy(),
+                )
+    raise ValueError(f"No valid 2D image array in {filename}")
 
 
-def _center_crop_or_pad_tensor(tensor, size):
-    """Center-crop or zero-pad a 2D tensor to a square of ``size`` pixels."""
+def _catalog_pixel_center(header, ra, dec):
+    """Project a catalog coordinate onto this image, or None when it cannot."""
+    if ra is None or dec is None:
+        return None
+    ra = float(ra)
+    dec = float(dec)
+    if not (np.isfinite(ra) and np.isfinite(dec)):
+        return None
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        wcs = WCS(header)
+    if not wcs.has_celestial:
+        return None
+    wcs = wcs.celestial
+
+    has_distortion = any(
+        component is not None
+        for component in (
+            wcs.sip,
+            wcs.cpdis1,
+            wcs.cpdis2,
+            wcs.det2im1,
+            wcs.det2im2,
+        )
+    )
+    # HSC coadd cutouts carry a plain TAN WCS, so the linear solution is exact
+    # and avoids an iterative solve per band per object.
+    if has_distortion:
+        x, y = wcs.all_world2pix(ra, dec, 0)
+    else:
+        x, y = wcs.wcs_world2pix(ra, dec, 0)
+    x = float(x)
+    y = float(y)
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+    return y, x
+
+
+def _bands_share_a_pixel_grid(centers):
+    """True when every band places the catalog center on the same subpixel."""
+    reference_y, reference_x = centers[0]
+    for center_y, center_x in centers[1:]:
+        for offset in (center_y - reference_y, center_x - reference_x):
+            if abs(offset - round(offset)) > BAND_ALIGNMENT_TOLERANCE_PIX:
+                return False
+    return True
+
+
+def _center_crop_or_pad_tensor(tensor, size, center):
+    """Crop or zero-pad a 2D tensor to ``size`` about an explicit center.
+
+    ``center`` is the ``(y, x)`` position, in this tensor's own zero-based
+    continuous pixel coordinates, that must land on the output's geometric
+    center ``(size - 1) / 2``; ``None`` selects the input's own geometric
+    center. The window origin is rounded to the nearest integer, so the
+    requested center lands within half a pixel of the output center and no
+    interpolation is performed.
+
+    Passing the source position measured from the catalog coordinate and the
+    image WCS is what keeps FITS-backed rows on the same subpixel convention
+    as generated pairs, which place their central source by the same rule.
+    An odd input dimension cannot put an even window on the input's own
+    center, so ``None`` is half a pixel off by construction; only rows with
+    no source to center are entitled to it.
+    """
     height, width = tensor.shape
-    pad_height = max(0, size - height)
-    pad_width = max(0, size - width)
-    if pad_height or pad_width:
-        pad_top = pad_height // 2
-        pad_bottom = pad_height - pad_top
-        pad_left = pad_width // 2
-        pad_right = pad_width - pad_left
+    if center is None:
+        center_y = (height - 1) / 2
+        center_x = (width - 1) / 2
+    else:
+        center_y, center_x = (float(value) for value in center)
+
+    offset = (size - 1) / 2
+    start_y = int(np.floor(center_y - offset + 0.5))
+    start_x = int(np.floor(center_x - offset + 0.5))
+
+    pad_top = max(0, -start_y)
+    pad_left = max(0, -start_x)
+    pad_bottom = max(0, start_y + size - height)
+    pad_right = max(0, start_x + size - width)
+    if pad_top or pad_bottom or pad_left or pad_right:
         tensor = F.pad(
             tensor,
             (pad_left, pad_right, pad_top, pad_bottom),
             mode="constant",
             value=0.0,
         )
-        height, width = tensor.shape
+        start_y += pad_top
+        start_x += pad_left
 
-    start_y = height // 2 - size // 2
-    start_x = width // 2 - size // 2
     return tensor[start_y:start_y + size, start_x:start_x + size]
 
 
@@ -193,41 +277,66 @@ def _load_pair_h5_tensor(task):
 def process_single_object(task):
     """Load one FITS-backed or pair-HDF5-backed tensor row."""
     if task.tensor_store is not None:
-        return task.df_index, _load_pair_h5_tensor(task)
+        return (
+            task.df_index,
+            _load_pair_h5_tensor(task),
+            CENTERING_PAIR_TENSOR,
+        )
 
     if task.fits_paths is None:
         raise ValueError(f"Input row {task.df_index} has no tensor source")
-    channels = []
 
+    images = []
+    centers = []
     for fits_path in task.fits_paths:
         try:
-            tensor_2d = _load_fits_tensor(fits_path)
-            tensor_2d = _center_crop_or_pad_tensor(
-                tensor_2d,
-                task.cutout_size,
-            )
-            channels.append(tensor_2d)
+            image, header = _load_fits_image(fits_path)
+            centers.append(_catalog_pixel_center(header, task.ra, task.dec))
+            images.append(image)
         except Exception:
             # Signal failure by returning None instead of zero-padding
-            return task.df_index, None
+            return task.df_index, None, CENTERING_FAILED
+
+    if any(center is None for center in centers):
+        # A row without a catalog position or without a celestial WCS falls
+        # back for every band at once, never band by band. Background windows
+        # are the intended case: they carry no source to center.
+        centers = [None] * len(centers)
+        centering = CENTERING_GEOMETRIC
+    elif not _bands_share_a_pixel_grid(centers):
+        # Integer slicing cannot co-register these bands, and the residual
+        # offset would read as a color gradient on the source itself.
+        return task.df_index, None, CENTERING_BAND_MISALIGNED
+    else:
+        centering = CENTERING_CATALOG_WCS
+
+    try:
+        channels = [
+            _center_crop_or_pad_tensor(image, task.cutout_size, center)
+            for image, center in zip(images, centers)
+        ]
+    except Exception:
+        return task.df_index, None, CENTERING_FAILED
 
     stacked_tensor = torch.stack(channels, dim=0)
 
-    return task.df_index, stacked_tensor.numpy()
+    return task.df_index, stacked_tensor.numpy(), centering
 
 
 def process_object_batch(task_batch):
     """Process one ordered task batch into a contiguous HDF5 write block."""
     successful_indices = []
     arrays = []
+    centering_counts = Counter()
     for task_args in task_batch:
-        df_index, array = process_single_object(task_args)
+        df_index, array, centering = process_single_object(task_args)
+        centering_counts[centering] += 1
         if array is not None:
             successful_indices.append(df_index)
             arrays.append(array)
 
     stacked = np.stack(arrays, axis=0) if arrays else None
-    return len(task_batch), successful_indices, stacked
+    return len(task_batch), successful_indices, stacked, centering_counts
 
 
 def _rows_per_batch(channel_count, cutout_size):
@@ -260,6 +369,17 @@ def _iter_task_batches(
         tensor_object_ids = df[TENSOR_OBJECT_ID_COLUMN].to_numpy(dtype=object)
     else:
         tensor_stores = tensor_object_ids = None
+    if {RA_COLUMN, DEC_COLUMN}.issubset(df.columns):
+        ra_values = pd.to_numeric(
+            df[RA_COLUMN],
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
+        dec_values = pd.to_numeric(
+            df[DEC_COLUMN],
+            errors="coerce",
+        ).to_numpy(dtype=np.float64)
+    else:
+        ra_values = dec_values = None
 
     for df_index in range(len(df)):
         if tensor_rows[df_index]:
@@ -274,6 +394,8 @@ def _iter_task_batches(
                 tensor_object_id=str(tensor_object_ids[df_index]),
                 cutout_size=cutout_size,
                 bands=tuple(bands),
+                ra=None,
+                dec=None,
             )
         else:
             row_paths = band_values[df_index]
@@ -287,6 +409,12 @@ def _iter_task_batches(
                 tensor_object_id=None,
                 cutout_size=cutout_size,
                 bands=tuple(bands),
+                ra=(
+                    None if ra_values is None else float(ra_values[df_index])
+                ),
+                dec=(
+                    None if dec_values is None else float(dec_values[df_index])
+                ),
             )
         batch.append(task)
         if len(batch) == batch_rows:
@@ -457,6 +585,14 @@ def create_cutout_tensors(
     click.echo(
         f"Inputs: FITS={fits_count}, pair_HDF5={tensor_count}."
     )
+    if fits_count and not {RA_COLUMN, DEC_COLUMN}.issubset(df.columns):
+        click.echo(
+            f"WARNING: {csv_path} has no {RA_COLUMN}/{DEC_COLUMN} columns, so "
+            f"every FITS-backed row falls back to its own geometric center. "
+            f"For rows that do contain a source this leaves them half a pixel "
+            f"off the convention generated pairs use, which is a class-"
+            f"correlated offset the model can read."
+        )
     click.echo(f"Using {workers} CPU workers.")
 
     h5_path = out_dir / "tensors.h5"
@@ -481,6 +617,7 @@ def create_cutout_tensors(
 
             current_h5_idx = 0
             successful_indices = []
+            centering_totals = Counter()
 
             task_batches = _iter_task_batches(
                 df,
@@ -502,8 +639,14 @@ def create_cutout_tensors(
                     max_pending=workers * PREFETCH_BATCHES_PER_WORKER,
                 )
                 with tqdm(total=max_len, unit='object') as progress:
-                    for processed_count, batch_indices, numpy_batch in results:
+                    for (
+                        processed_count,
+                        batch_indices,
+                        numpy_batch,
+                        batch_centering,
+                    ) in results:
                         progress.update(processed_count)
+                        centering_totals.update(batch_centering)
                         if numpy_batch is None:
                             continue
                         next_h5_idx = current_h5_idx + len(batch_indices)
@@ -532,6 +675,15 @@ def create_cutout_tensors(
     click.echo(
         f"Finished! Packed {len(successful_indices)} tensors "
         f"sequentially into {h5_path}"
+    )
+    click.echo(
+        "Centering: "
+        f"catalog WCS={centering_totals[CENTERING_CATALOG_WCS]}, "
+        f"geometric fallback={centering_totals[CENTERING_GEOMETRIC]}, "
+        f"pair tensors={centering_totals[CENTERING_PAIR_TENSOR]}; "
+        f"dropped for band misalignment="
+        f"{centering_totals[CENTERING_BAND_MISALIGNED]}, "
+        f"dropped for load failure={centering_totals[CENTERING_FAILED]}."
     )
     click.echo(
         f"Saved aligned metadata to {info_path}"
