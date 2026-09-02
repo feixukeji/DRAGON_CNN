@@ -12,6 +12,10 @@ from utils import (
     validate_asinh_stats,
 )
 
+PIXEL_HIGH_STATISTIC = "pixel"
+PEAK_HIGH_STATISTIC = "peak"
+HIGH_STATISTICS = (PIXEL_HIGH_STATISTIC, PEAK_HIGH_STATISTIC)
+
 
 def _sample_h5_in_chunk_order(
     dataset,
@@ -77,6 +81,9 @@ def _sample_h5_in_chunk_order(
         sampled = np.empty(
             (channels, num_images, per_image_limit), dtype=np.float32
         )
+        # Peaks come from every pixel of the cutout, not from the subsample; a
+        # random 1000-pixel draw almost never contains the source core.
+        peaks = np.empty((channels, num_images), dtype=np.float32)
         row_bytes = pixels_per_image * channels * images.dtype.itemsize
         chunk_rows = (
             int(images.chunks[0])
@@ -122,14 +129,21 @@ def _sample_h5_in_chunk_order(
                     neginf=0.0,
                     copy=False,
                 )
+                image_peaks = np.nan_to_num(
+                    flat, nan=-np.inf, posinf=-np.inf, neginf=-np.inf, copy=True
+                ).max(axis=2)
                 for channel in range(channels):
                     sampled[channel, logical_indices] = selected[:, channel]
+                    peaks[channel, logical_indices] = image_peaks[:, channel]
                 progress.update(len(logical_indices))
         finally:
             progress.close()
 
     # Keep the same nested shape consumed by the generic aggregation below.
-    return [[sampled[channel].reshape(-1)] for channel in range(channels)]
+    return (
+        [[sampled[channel].reshape(-1)] for channel in range(channels)],
+        [peaks[channel] for channel in range(channels)],
+    )
 
 
 def compute_asinh_stats(
@@ -142,13 +156,27 @@ def compute_asinh_stats(
     max_samples_per_channel=2_000_000,
     seed=42,
     show_progress=True,
+    high_statistic=PIXEL_HIGH_STATISTIC,
 ):
     """Estimate per-channel percentiles with bounded, per-cutout sampling.
 
     Set ``max_samples_per_channel=0`` to disable the global cap.
+
+    ``high_statistic`` selects the population ``high_pct`` is taken over when
+    setting ``vmax``. ``"pixel"`` uses the sampled pixels, which are dominated
+    by sky and therefore place ``vmax`` far below any source core, clipping
+    bright sources into a flat plateau and discarding their colour. ``"peak"``
+    uses one whole-cutout maximum per image and channel instead, so ``vmax``
+    tracks the source brightness distribution. ``vmin`` always comes from the
+    sampled pixels.
     """
     if not 0.0 <= low_pct < high_pct <= 100.0:
         raise ValueError("Percentiles must satisfy 0 <= low_pct < high_pct <= 100.")
+    if high_statistic not in HIGH_STATISTICS:
+        raise ValueError(
+            f"high_statistic must be one of {HIGH_STATISTICS}; "
+            f"received {high_statistic!r}."
+        )
     if channels <= 0:
         raise ValueError("channels must be greater than zero.")
     softening = validate_asinh_softening(softening)
@@ -168,7 +196,7 @@ def compute_asinh_stats(
         )
 
     rng = np.random.default_rng(seed)
-    samples_by_channel = _sample_h5_in_chunk_order(
+    sampled = _sample_h5_in_chunk_order(
         dataset=dataset,
         channels=channels,
         num_images=num_images,
@@ -176,8 +204,10 @@ def compute_asinh_stats(
         rng=rng,
         show_progress=show_progress,
     )
+    samples_by_channel, peaks_by_channel = (None, None) if sampled is None else sampled
     if samples_by_channel is None:
         samples_by_channel = [[] for _ in range(channels)]
+        peaks_by_channel = [[] for _ in range(channels)]
         iterator = tqdm(
             range(num_images),
             desc="Sampling normalization stats",
@@ -202,6 +232,9 @@ def compute_asinh_stats(
                 flat = np.nan_to_num(
                     flat, nan=0.0, posinf=0.0, neginf=0.0
                 )
+                # Take the peak before subsampling, for the same reason as the
+                # HDF5 path: a subsample rarely contains the source core.
+                peaks_by_channel[channel].append(flat.max())
                 if per_image_limit and flat.size > per_image_limit:
                     flat = flat[
                         rng.choice(
@@ -225,13 +258,26 @@ def compute_asinh_stats(
         values_by_channel.append(values)
 
     vmin = [float(np.percentile(values, low_pct)) for values in values_by_channel]
-    vmax = [float(np.percentile(values, high_pct)) for values in values_by_channel]
+    if high_statistic == PEAK_HIGH_STATISTIC:
+        peak_values = [
+            np.asarray(peaks, dtype=np.float32).reshape(-1)
+            for peaks in peaks_by_channel
+        ]
+        if any(not values.size for values in peak_values):
+            raise ValueError("No cutout peaks were found in the requested split.")
+        peak_values = [values[np.isfinite(values)] for values in peak_values]
+        if any(not values.size for values in peak_values):
+            raise ValueError("Every cutout peak in the requested split is non-finite.")
+        vmax = [float(np.percentile(values, high_pct)) for values in peak_values]
+    else:
+        vmax = [float(np.percentile(values, high_pct)) for values in values_by_channel]
     if any(high <= low for low, high in zip(vmin, vmax)):
         raise ValueError("Computed vmax must be greater than vmin for every channel.")
 
     return {
         "low_pct": low_pct,
         "high_pct": high_pct,
+        "high_statistic": high_statistic,
         "softening": softening,
         "vmin": vmin,
         "vmax": vmax,

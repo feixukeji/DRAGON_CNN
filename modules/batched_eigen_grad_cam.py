@@ -41,7 +41,13 @@ class _ActivationCapture:
 
 
 def batched_eigen_projection(weighted_activations: Tensor) -> Tensor:
-    """Return the first principal-component image for a batch of feature maps."""
+    """Return the first principal-component image for a batch of feature maps.
+
+    The singular vector is only defined up to sign, so it is oriented towards
+    the mean feature vector. Without this the CAM is inverted for an arbitrary
+    subset of images and, after the caller's rectification, marks everything
+    except the source.
+    """
     if weighted_activations.ndim != 4:
         raise ValueError(
             "Expected weighted activations with shape (batch, channels, height, width), "
@@ -60,11 +66,21 @@ def batched_eigen_projection(weighted_activations: Tensor) -> Tensor:
     matrices = finite_activations.flatten(start_dim=2).transpose(1, 2)
     if matrices.dtype in (torch.float16, torch.bfloat16):
         matrices = matrices.float()
-    matrices = matrices - matrices.mean(dim=1, keepdim=True)
+    mean_features = matrices.mean(dim=1, keepdim=True)
+    matrices = matrices - mean_features
 
     _, _, vh = torch.linalg.svd(matrices, full_matrices=False)
-    principal_directions = vh[:, 0, :].unsqueeze(-1)
-    projections = torch.bmm(matrices, principal_directions).squeeze(-1)
+    principal_directions = vh[:, 0, :]
+    orientation = (principal_directions * mean_features.squeeze(1)).sum(dim=1)
+    principal_directions = principal_directions * torch.where(
+        orientation < 0,
+        -1.0,
+        1.0,
+    ).to(principal_directions.dtype).unsqueeze(1)
+    projections = torch.bmm(
+        matrices,
+        principal_directions.unsqueeze(-1),
+    ).squeeze(-1)
     return projections.reshape(batch_size, height, width)
 
 

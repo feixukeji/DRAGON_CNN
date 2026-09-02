@@ -11,7 +11,12 @@ from utils import (
 )
 
 from .dataset import HDF5Dataset
-from .normalization import compute_asinh_stats, save_asinh_stats
+from .normalization import (
+    HIGH_STATISTICS,
+    PIXEL_HIGH_STATISTIC,
+    compute_asinh_stats,
+    save_asinh_stats,
+)
 
 
 @click.command()
@@ -31,6 +36,18 @@ from .normalization import compute_asinh_stats, save_asinh_stats
 )
 @click.option(
     "--high-pct", type=float, default=DEFAULT_HIGH_PERCENTILE, show_default=True
+)
+@click.option(
+    "--high-statistic",
+    type=click.Choice(HIGH_STATISTICS),
+    default=PIXEL_HIGH_STATISTIC,
+    show_default=True,
+    help=(
+        "Population --high-pct is taken over when setting vmax. 'pixel' "
+        "samples pixels, which are dominated by sky and clip source cores "
+        "into a flat plateau. 'peak' uses one whole-cutout maximum per "
+        "image and channel, so vmax tracks source brightness."
+    ),
 )
 @click.option(
     "--asinh-softening",
@@ -54,6 +71,7 @@ def main(
     channels,
     low_pct,
     high_pct,
+    high_statistic,
     asinh_softening,
     sample_per_image,
     max_samples_per_channel,
@@ -73,6 +91,7 @@ def main(
             channels=channels,
             low_pct=low_pct,
             high_pct=high_pct,
+            high_statistic=high_statistic,
             softening=asinh_softening,
             sample_per_image=sample_per_image,
             max_samples_per_channel=max_samples_per_channel,
